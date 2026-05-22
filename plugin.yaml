@@ -1,0 +1,68 @@
+name: xlicense
+version: 1.0.0
+author: xcore
+description: >
+  Gestionnaire de licences enterprise pour Xcore — cycle de vie, state machine,
+  et middleware de protection globale par tenant.
+
+execution_mode: trusted
+entry_point: src/main.py
+framework_version: ">=2.0.0"
+
+# ── Configuration du plugin ───────────────────────────────────────────────────
+config:
+  # Activation du blocage 402 si licence non active sur routes protégées
+  enforce: true
+  
+  # Routes exclues de la vérification de licence
+  excluded_prefixes:
+    - "/docs"
+    - "/redoc"
+    - "/openapi"
+    - "/health"
+    - "/xlicense/verify"
+    - "/app/auth/login"
+    - "/app/auth/register"
+    - "/app/auth/refresh"
+    - "/app/auth/logout"
+    - "/app/auth/select-tenant"
+    - "/app/auth/oauth"
+    - "/app/auth/me"
+    - "/app/auth/tenants"
+    - "/app/auth/invites"
+    - "/app/auth/password/forgot"
+    - "/app/auth/password/reset"
+    - "/app/xlicense/me"
+    - "/app/xlicense/plans"
+    - "/app/xlicense/licenses"
+    - "/app/xlicense/verify"
+
+  # Routes protégées (si vide, toutes les routes non exclues sont protégées)
+  protected_prefixes: []
+
+# ── Variables d'environnement ─────────────────────────────────────────────────
+# Chargées depuis app/xauth/.env avant résolution des ${VAR}
+
+#envconfiguration:
+#  inject: true
+#  env_file: .env
+
+env:
+  JWT_PRIVATE_KEY_PATH: ./conf/private.pem
+  JWT_PUBLIC_KEY_PATH: ./conf/public.pem
+
+
+
+# ── Permissions inter-plugins ─────────────────────────────────────────────────
+permissions:
+  - resource: "registry"
+    actions: ["*"]
+    effect: allow
+
+# ── Ressources ────────────────────────────────────────────────────────────────
+resources:
+  timeout_seconds: 30
+  max_memory_mb: 256
+  rate_limit:
+    calls: 1000
+    period_seconds: 60
