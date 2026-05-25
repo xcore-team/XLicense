@@ -6,11 +6,10 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
-
 from ..models.license import License, LicenseState
 from ..repositories.license import LicensePlanRepository, LicenseRepository
 from ..schemas import LicenseResponse, LisenseCreate
+from ..services.events import XLicenseEvents
 from ..services.jwt import LicenseTokenService
 from ..state_machine import LicenseStateMachine, LicenseStateMachineError
 
@@ -49,11 +48,13 @@ class LicenseService:
         license_repository: LicenseRepository,
         plan_repository: LicensePlanRepository | None = None,
         cache_service: "CacheService | None" = None,
+        events: XLicenseEvents | None = None,
     ) -> None:
         self._token = token_service
         self._repo = license_repository
         self._plan_repo = plan_repository
         self._cache = cache_service
+        self._events = events
 
     # ── Creation ──────────────────────────────────────────────────────────────
 
@@ -65,7 +66,8 @@ class LicenseService:
         state = LicenseState(state_value)
         plan_uuid = UUID(str(data.plan_id))
 
-        expires_at = now + timedelta(days=data.expires_at) if data.expires_at else None
+        expires_at = now + \
+            timedelta(days=data.expires_at) if data.expires_at else None
 
         license_key = self._token.create_license_token(
             tenant_id=data.tenant_id,
@@ -98,6 +100,16 @@ class LicenseService:
             data.plan_id,
             expires_at,
         )
+
+        if self._events:
+            await self._events.license_created(
+                license_id=license_id,
+                tenant_id=data.tenant_id,
+                plan_id=str(data.plan_id),
+                state=state.value,
+                expires_at=expires_at.isoformat() if expires_at else None,
+            )
+
         return response
 
     # ── State transitions ─────────────────────────────────────────────────────
@@ -119,7 +131,8 @@ class LicenseService:
             raise ValueError(f"Licence introuvable : {license_id}")
 
         sm = LicenseStateMachine(lic)
-        sm.transition(to, reason=reason)  # raises LicenseStateMachineError if invalid
+        # raises LicenseStateMachineError if invalid
+        sm.transition(to, reason=reason)
 
         lic.state = to
         lic.updated_at = datetime.now(tz=timezone.utc)
@@ -128,35 +141,34 @@ class LicenseService:
         await self._invalidate(lic)
 
         transition_meta = getattr(lic, "_last_transition", {})
+        from_state = transition_meta.get("from", "")
         logger.info(
             "Transition licence [%s] : %s → %s (%s)",
             license_id,
-            transition_meta.get("from"),
+            from_state,
             transition_meta.get("to"),
             transition_meta.get("reason"),
         )
+
+        if self._events:
+            await self._events.license_transitioned(
+                license_id=license_id,
+                tenant_id=str(lic.tenant_id),
+                from_state=str(from_state),
+                to_state=to.value,
+                reason=reason,
+            )
+
         return _to_response(lic)
 
-    async def activate(
-        self, license_id: str, reason: str | None = None
-    ) -> LicenseResponse:
-        return await self.transition(
-            license_id, LicenseState.ACTIVE, reason=reason or "Activation manuelle"
-        )
+    async def activate(self, license_id: str, reason: str | None = None) -> LicenseResponse:
+        return await self.transition(license_id, LicenseState.ACTIVE, reason=reason or "Activation manuelle")
 
-    async def suspend(
-        self, license_id: str, reason: str | None = None
-    ) -> LicenseResponse:
-        return await self.transition(
-            license_id, LicenseState.SUSPENDED, reason=reason or "Suspension manuelle"
-        )
+    async def suspend(self, license_id: str, reason: str | None = None) -> LicenseResponse:
+        return await self.transition(license_id, LicenseState.SUSPENDED, reason=reason or "Suspension manuelle")
 
-    async def revoke(
-        self, license_id: str, reason: str | None = None
-    ) -> LicenseResponse:
-        return await self.transition(
-            license_id, LicenseState.REVOKED, reason=reason or "Révocation manuelle"
-        )
+    async def revoke(self, license_id: str, reason: str | None = None) -> LicenseResponse:
+        return await self.transition(license_id, LicenseState.REVOKED, reason=reason or "Révocation manuelle")
 
     async def renew(
         self,
@@ -177,15 +189,23 @@ class LicenseService:
         lic.expires_at = base + timedelta(days=extend_days)
 
         if sm.can_transition(LicenseState.ACTIVE):
-            sm.transition(
-                LicenseState.ACTIVE, reason=reason or f"Renouvellement +{extend_days}j"
-            )
+            sm.transition(LicenseState.ACTIVE,
+                          reason=reason or f"Renouvellement +{extend_days}j")
 
         lic.updated_at = now
         await self._repo.session.flush()
         await self._invalidate(lic)
 
-        logger.info("Licence [%s] renouvelée jusqu'au %s", license_id, lic.expires_at)
+        logger.info("Licence [%s] renouvelée jusqu'au %s",
+                    license_id, lic.expires_at)
+
+        if self._events:
+            await self._events.license_renewed(
+                license_id=license_id,
+                tenant_id=str(lic.tenant_id),
+                expires_at=lic.expires_at.isoformat() if lic.expires_at else None,
+            )
+
         return _to_response(lic)
 
     # ── Auto-expiry sweep ─────────────────────────────────────────────────────
@@ -201,9 +221,9 @@ class LicenseService:
         expired_ids: list[str] = []
 
         for state in (LicenseState.ACTIVE, LicenseState.TRIAL):
-            # Après
             result = await self._repo.session.execute(
-                select(License)
+                __import__("sqlalchemy", fromlist=["select"])
+                .select(License)
                 .where(License.state == state)
                 .where(License.expires_at < datetime.now(tz=timezone.utc))
             )
@@ -212,16 +232,21 @@ class LicenseService:
             for lic in licenses:
                 sm = LicenseStateMachine(lic)
                 if sm.can_transition(LicenseState.EXPIRED):
-                    sm.transition(
-                        LicenseState.EXPIRED, reason="Expiration automatique (sweep)"
-                    )
+                    sm.transition(LicenseState.EXPIRED,
+                                  reason="Expiration automatique (sweep)")
                     lic.updated_at = datetime.now(tz=timezone.utc)
                     await self._invalidate(lic)
                     expired_ids.append(str(lic.id))
+                    if self._events:
+                        await self._events.license_expired(
+                            license_id=str(lic.id),
+                            tenant_id=str(lic.tenant_id),
+                        )
 
         if expired_ids:
             await self._repo.session.flush()
-            logger.info("Auto-expiry : %d licence(s) expirée(s)", len(expired_ids))
+            logger.info("Auto-expiry : %d licence(s) expirée(s)",
+                        len(expired_ids))
 
         return expired_ids
 
@@ -247,11 +272,7 @@ class LicenseService:
         # 2. DB lookup (cache-aside)
         lic = await self._load_with_cache(license_id)
         if lic is None:
-            return {
-                "valid": False,
-                "reason": "Licence non trouvée",
-                "state": "not_found",
-            }
+            return {"valid": False, "reason": "Licence non trouvée", "state": "not_found"}
 
         if not self._token.verify_token_signature(license_key, lic.license_hash):
             return {
@@ -291,9 +312,7 @@ class LicenseService:
         # 1. Cache hit
         if self._cache:
             try:
-                raw = await self._cache.get(
-                    _CACHE_KEY_ACTIVE.format(tenant_id=tenant_id)
-                )
+                raw = await self._cache.get(_CACHE_KEY_ACTIVE.format(tenant_id=tenant_id))
                 if raw:
                     data = json.loads(raw) if isinstance(raw, str) else raw
                     # Reconstruct lightweight object to run auto_expire if needed
@@ -314,7 +333,8 @@ class LicenseService:
 
         # Sort: ACTIVE first, then most recent
         licenses.sort(
-            key=lambda l: (l.state == LicenseState.ACTIVE, l.issued_at), reverse=True
+            key=lambda l: (l.state == LicenseState.ACTIVE, l.issued_at),
+            reverse=True
         )
         lic = licenses[0]
 
@@ -358,6 +378,13 @@ class LicenseService:
 
         await self._invalidate(lic)
         logger.info("Clé rotée pour la licence [%s]", license_id)
+
+        if self._events:
+            await self._events.license_key_rotated(
+                license_id=license_id,
+                tenant_id=str(lic.tenant_id),
+            )
+
         return _to_response(lic)
 
     # ── Queries ───────────────────────────────────────────────────────────────
@@ -411,13 +438,9 @@ class LicenseService:
     async def _load_with_cache(self, license_id: str):
         if self._cache:
             try:
-                raw = await self._cache.get(
-                    _CACHE_KEY_BY_ID.format(license_id=license_id)
-                )
+                raw = await self._cache.get(_CACHE_KEY_BY_ID.format(license_id=license_id))
                 if raw:
-                    return _dict_to_lic(
-                        json.loads(raw) if isinstance(raw, str) else raw
-                    )
+                    return _dict_to_lic(json.loads(raw) if isinstance(raw, str) else raw)
             except Exception:
                 pass
         return await self._repo.get_by_license_id(license_id)
@@ -425,33 +448,40 @@ class LicenseService:
 
 # ── Serialization ─────────────────────────────────────────────────────────────
 
-
-def _lic_to_dict(lic) -> dict:
+def _lic_to_dict(lic, plan=None) -> dict:
+    _plan = plan or getattr(lic, "plan", None)
     return {
         "id": str(lic.id),
         "tenant_id": str(lic.tenant_id),
         "plan_id": str(lic.plan_id),
-        "state": lic.state.value if hasattr(lic.state, "value") else str(lic.state),
+        "state": (
+            lic.state.value if hasattr(lic.state, "value") else str(lic.state)
+        ),
         "license_key": lic.license_key,
         "license_hash": lic.license_hash,
-        "issued_at": lic.issued_at.isoformat()
-        if getattr(lic, "issued_at", None)
-        else None,
-        "expires_at": lic.expires_at.isoformat()
-        if getattr(lic, "expires_at", None)
-        else None,
-        "last_validation_at": lic.last_validation_at.isoformat()
-        if getattr(lic, "last_validation_at", None)
-        else None,
-        "updated_at": lic.updated_at.isoformat()
-        if getattr(lic, "updated_at", None)
-        else None,
+        "issued_at": (
+            lic.issued_at.isoformat()
+            if getattr(lic, "issued_at", None) else None
+        ),
+        "expires_at": (
+            lic.expires_at.isoformat()
+            if getattr(lic, "expires_at", None) else None
+        ),
+        "last_validation_at": (
+            lic.last_validation_at.isoformat()
+            if getattr(lic, "last_validation_at", None) else None
+        ),
+        "updated_at": (
+            lic.updated_at.isoformat()
+            if getattr(lic, "updated_at", None) else None
+        ),
+        "features": getattr(_plan, "features", None) or {},
+        "quotas": getattr(_plan, "quotas", None) or {},
     }
 
 
 def _dict_to_lic(data: dict):
     """Reconstruit un proxy depuis le cache."""
-
     class _Proxy:
         pass
 
@@ -482,7 +512,8 @@ def _to_response(lic) -> LicenseResponse:
         id=lic.id,
         tenant_id=str(lic.tenant_id),
         plan_id=lic.plan_id,
-        state=lic.state.value if hasattr(lic.state, "value") else str(lic.state),
+        state=lic.state.value if hasattr(
+            lic.state, "value") else str(lic.state),
         license_key=lic.license_key,
         license_hash=lic.license_hash,
         issued_at=getattr(lic, "issued_at", None),  # type: ignore

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 State machine for license lifecycle.
 
@@ -17,11 +15,12 @@ Transitions:
     REVOKED    → (terminal — no further transition)
 """
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from typing import Callable
 
 from .models.license import LicenseState
-
 
 # ── Transition table ──────────────────────────────────────────────────────────
 # { from_state: { to_state: guard | None } }
@@ -29,38 +28,38 @@ from .models.license import LicenseState
 
 _TRANSITIONS: dict[LicenseState, dict[LicenseState, Callable | None]] = {
     LicenseState.TRIAL: {
-        LicenseState.ACTIVE:    None,
-        LicenseState.EXPIRED:   None,
-        LicenseState.REVOKED:   None,
+        LicenseState.ACTIVE: None,
+        LicenseState.EXPIRED: None,
+        LicenseState.REVOKED: None,
     },
     LicenseState.ACTIVE: {
         LicenseState.SUSPENDED: None,
-        LicenseState.EXPIRED:   None,
-        LicenseState.REVOKED:   None,
+        LicenseState.EXPIRED: None,
+        LicenseState.REVOKED: None,
     },
     LicenseState.SUSPENDED: {
-        LicenseState.ACTIVE:    None,
-        LicenseState.REVOKED:   None,
+        LicenseState.ACTIVE: None,
+        LicenseState.REVOKED: None,
     },
     LicenseState.EXPIRED: {
-        LicenseState.ACTIVE:    None,   # renewal
-        LicenseState.REVOKED:   None,
+        LicenseState.ACTIVE: None,  # renewal
+        LicenseState.REVOKED: None,
     },
-    LicenseState.REVOKED: {},           # terminal
+    LicenseState.REVOKED: {},  # terminal
 }
 
 # Human-readable reason defaults per transition
 _DEFAULT_REASONS: dict[tuple[LicenseState, LicenseState], str] = {
-    (LicenseState.TRIAL,      LicenseState.ACTIVE):    "Licence activée",
-    (LicenseState.TRIAL,      LicenseState.EXPIRED):   "Période d'essai expirée",
-    (LicenseState.TRIAL,      LicenseState.REVOKED):   "Licence révoquée",
-    (LicenseState.ACTIVE,     LicenseState.SUSPENDED): "Licence suspendue",
-    (LicenseState.ACTIVE,     LicenseState.EXPIRED):   "Licence expirée",
-    (LicenseState.ACTIVE,     LicenseState.REVOKED):   "Licence révoquée",
-    (LicenseState.SUSPENDED,  LicenseState.ACTIVE):    "Licence réactivée",
-    (LicenseState.SUSPENDED,  LicenseState.REVOKED):   "Licence révoquée définitivement",
-    (LicenseState.EXPIRED,    LicenseState.ACTIVE):    "Licence renouvelée",
-    (LicenseState.EXPIRED,    LicenseState.REVOKED):   "Licence révoquée après expiration",
+    (LicenseState.TRIAL, LicenseState.ACTIVE): "Licence activée",
+    (LicenseState.TRIAL, LicenseState.EXPIRED): "Période d'essai expirée",
+    (LicenseState.TRIAL, LicenseState.REVOKED): "Licence révoquée",
+    (LicenseState.ACTIVE, LicenseState.SUSPENDED): "Licence suspendue",
+    (LicenseState.ACTIVE, LicenseState.EXPIRED): "Licence expirée",
+    (LicenseState.ACTIVE, LicenseState.REVOKED): "Licence révoquée",
+    (LicenseState.SUSPENDED, LicenseState.ACTIVE): "Licence réactivée",
+    (LicenseState.SUSPENDED, LicenseState.REVOKED): "Licence révoquée définitivement",
+    (LicenseState.EXPIRED, LicenseState.ACTIVE): "Licence renouvelée",
+    (LicenseState.EXPIRED, LicenseState.REVOKED): "Licence révoquée après expiration",
 }
 
 

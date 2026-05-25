@@ -33,11 +33,10 @@ class BaseRepository(Generic[ModelT]):
     async def delete(self, obj: ModelT) -> None:
         await self.session.delete(obj)
         await self.session.flush()
-    
+
     async def update(self, obj: ModelT, **kwargs: Any) -> ModelT:
         for key, value in kwargs.items():
             setattr(obj, key, value)
         await self.session.flush()
         await self.session.refresh(obj)
         return obj
-    

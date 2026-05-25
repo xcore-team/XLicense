@@ -1,18 +1,29 @@
+from typing import Awaitable, Callable
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel
 from xcore.kernel.api import AuthPayload, get_current_user
 from xcore.sdk import require_permission
 
-
-from .repositories.license import LicenseRepository, LicensePlanRepository
+from .repositories.license import LicensePlanRepository, LicenseRepository
 from .schemas import LicenseResponse, LisenseCreate
+from .services.events import XLicenseEvents
 from .services.jwt import LicenseTokenService
 from .services.license import LicenseService
 from .state_machine import LicenseStateMachine, LicenseStateMachineError
-from app.xauth.src.services.tenant import TenantService
 
 
+class VerifyLicenseRequest(BaseModel):
+    license_key: str
 
-def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
+
+def build_router(
+    db,
+    cache,
+    token_service: LicenseTokenService,
+    caller: Callable[[str, str, dict], Awaitable[dict]] | None = None,
+    events: XLicenseEvents | None = None,
+) -> APIRouter:
     router = APIRouter(tags=["xlicense"])
 
     def _svc(session) -> LicenseService:
@@ -21,49 +32,52 @@ def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
             LicenseRepository(session),
             plan_repository=LicensePlanRepository(session),
             cache_service=cache,
+            events=events,
         )
 
-    async def _tenant_permissions(session, user: AuthPayload, tenant_id: str) -> tuple[bool, bool]:
+    async def _tenant_permissions(
+        user: AuthPayload, tenant_id: str
+    ) -> tuple[bool, bool]:
         perms = user.get("permissions", [])
         if "admin:*" in perms:
             return True, True
-        tenant_service = TenantService(session, cache=cache)
-        has_access = await tenant_service.user_has_access(user["sub"], tenant_id)
-        can_manage = await tenant_service.user_can_manage(user["sub"], tenant_id, perms)
-        return has_access, can_manage
+        if caller is None:
+            return False, False
+        result = await caller(
+            "xauth",
+            "xauth.tenant_access",
+            {
+                "user_id": user["sub"],
+                "tenant_id": tenant_id,
+                "permissions": perms,
+            },
+        )
+        return (
+            result.get("has_access", False),
+            result.get("can_manage", False),
+        )
 
-    async def _license_permissions(session, user: AuthPayload, license_id: str) -> tuple[object, bool, bool]:
+    async def _license_permissions(
+        session, user: AuthPayload, license_id: str
+    ) -> tuple[object, bool, bool]:
         repo = LicenseRepository(session)
         lic = await repo.get_by_license_id(license_id)
         if lic is None:
             raise HTTPException(status_code=404, detail="Licence non trouvée")
-        has_access, can_manage = await _tenant_permissions(session, user, str(lic.tenant_id))
+        has_access, can_manage = await _tenant_permissions(user, str(lic.tenant_id))
         return lic, has_access, can_manage
 
     # ── Public ────────────────────────────────────────────────────────────────
 
     @router.post("/verify", summary="Vérifier une clé de licence (public)")
-    async def verify_license(request: Request) -> dict:
-        """
-        Endpoint public — vérifie la validité d'une licence.
-        Appelé par les agents/machines pour valider leur clé.
-        """
-        body = await request.json()
-        license_key = body.get("license_key", "")
-        if not license_key:
-            raise HTTPException(status_code=422, detail="license_key requis")
-
+    async def verify_license(body: VerifyLicenseRequest) -> dict:
         async with db.session() as session:
-            result = await _svc(session).validate(license_key)
+            result = await _svc(session).validate(body.license_key)
             await session.commit()
         return result
 
     @router.get("/me", summary="Licence du tenant courant")
     async def my_license(request: Request) -> dict:
-        """
-        Retourne l'état de la licence injecté par le middleware.
-        Pratique pour les frontends.
-        """
         return {
             "valid": getattr(request.state, "license_valid", False),
             "state": getattr(request.state, "license_state", "unknown"),
@@ -72,12 +86,17 @@ def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
 
     # ── Plans ─────────────────────────────────────────────────────────────────
 
-    @router.post("/plans", status_code=status.HTTP_201_CREATED, summary="Créer un plan")
+    @router.post(
+        "/plans",
+        status_code=status.HTTP_201_CREATED,
+        summary="Créer un plan",
+    )
     async def create_plan(
         body: dict,
         _: AuthPayload = Depends(require_permission("admin:*")),
     ) -> dict:
         from .models.license import LicensePlan, LicenseType
+
         async with db.session() as session:
             plan = LicensePlan(
                 name=body["name"],
@@ -94,12 +113,12 @@ def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
                 "type": saved.type.value,
                 "max_users": saved.max_users,
                 "max_machines": saved.max_machines,
+                "features": saved.features or {},
+                "quotas": saved.quotas or {},
             }
 
     @router.get("/plans", summary="Lister les plans")
-    async def list_plans(
-        _: AuthPayload = Depends(get_current_user),
-    ) -> list:
+    async def list_plans() -> list:
         async with db.session() as session:
             repo = LicensePlanRepository(session)
             plans = await repo.all()
@@ -110,36 +129,45 @@ def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
                     "type": p.type.value,
                     "max_users": p.max_users,
                     "max_machines": p.max_machines,
+                    "features": p.features or {},
+                    "quotas": p.quotas or {},
                 }
                 for p in plans
             ]
 
     # ── Licences ──────────────────────────────────────────────────────────────
 
-    @router.post("/licenses", response_model=LicenseResponse, status_code=status.HTTP_201_CREATED)
+    @router.post(
+        "/licenses",
+        response_model=LicenseResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
     async def create_license(
         body: LisenseCreate,
         current_user: AuthPayload = Depends(get_current_user),
     ) -> LicenseResponse:
         async with db.session() as session:
-            _, can_manage = await _tenant_permissions(session, current_user, body.tenant_id)
+            _, can_manage = await _tenant_permissions(current_user, body.tenant_id)
             if not can_manage:
                 raise HTTPException(status_code=403, detail="Access denied")
             result = await _svc(session).create_license(body)
             await session.commit()
         return result
 
-    @router.get("/licenses/tenant/{tenant_id}", summary="Licences d'un tenant")
+    @router.get(
+        "/licenses/tenant/{tenant_id}",
+        summary="Licences d'un tenant",
+    )
     async def get_tenant_licenses(
         tenant_id: str,
         current_user: AuthPayload = Depends(get_current_user),
     ) -> list:
         async with db.session() as session:
-            has_access, _ = await _tenant_permissions(session, current_user, tenant_id)
+            has_access, _ = await _tenant_permissions(current_user, tenant_id)
             if not has_access:
                 raise HTTPException(status_code=403, detail="Access denied")
             licenses = await _svc(session).get_for_tenant(tenant_id)
-        return [l.model_dump() for l in licenses]
+        return [lic.model_dump() for lic in licenses]
 
     @router.get("/licenses/{license_id}", response_model=LicenseResponse)
     async def get_license(
@@ -147,7 +175,9 @@ def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
         current_user: AuthPayload = Depends(get_current_user),
     ) -> LicenseResponse:
         async with db.session() as session:
-            _, has_access, _ = await _license_permissions(session, current_user, license_id)
+            _, has_access, _ = await _license_permissions(
+                session, current_user, license_id
+            )
             if not has_access:
                 raise HTTPException(status_code=403, detail="Access denied")
             result = await _svc(session).get_by_id(license_id)
@@ -165,10 +195,14 @@ def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
     ) -> LicenseResponse:
         async with db.session() as session:
             try:
-                _, _, can_manage = await _license_permissions(session, current_user, license_id)
+                _, _, can_manage = await _license_permissions(
+                    session, current_user, license_id
+                )
                 if not can_manage:
                     raise HTTPException(status_code=403, detail="Access denied")
-                result = await _svc(session).activate(license_id, reason=body.get("reason"))
+                result = await _svc(session).activate(
+                    license_id, reason=body.get("reason")
+                )
                 await session.commit()
                 return result
             except (ValueError, LicenseStateMachineError) as exc:
@@ -182,10 +216,14 @@ def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
     ) -> LicenseResponse:
         async with db.session() as session:
             try:
-                _, _, can_manage = await _license_permissions(session, current_user, license_id)
+                _, _, can_manage = await _license_permissions(
+                    session, current_user, license_id
+                )
                 if not can_manage:
                     raise HTTPException(status_code=403, detail="Access denied")
-                result = await _svc(session).suspend(license_id, reason=body.get("reason"))
+                result = await _svc(session).suspend(
+                    license_id, reason=body.get("reason")
+                )
                 await session.commit()
                 return result
             except (ValueError, LicenseStateMachineError) as exc:
@@ -199,10 +237,14 @@ def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
     ) -> LicenseResponse:
         async with db.session() as session:
             try:
-                _, _, can_manage = await _license_permissions(session, current_user, license_id)
+                _, _, can_manage = await _license_permissions(
+                    session, current_user, license_id
+                )
                 if not can_manage:
                     raise HTTPException(status_code=403, detail="Access denied")
-                result = await _svc(session).revoke(license_id, reason=body.get("reason"))
+                result = await _svc(session).revoke(
+                    license_id, reason=body.get("reason")
+                )
                 await session.commit()
                 return result
             except (ValueError, LicenseStateMachineError) as exc:
@@ -216,7 +258,9 @@ def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
     ) -> LicenseResponse:
         async with db.session() as session:
             try:
-                _, _, can_manage = await _license_permissions(session, current_user, license_id)
+                _, _, can_manage = await _license_permissions(
+                    session, current_user, license_id
+                )
                 if not can_manage:
                     raise HTTPException(status_code=403, detail="Access denied")
                 result = await _svc(session).renew(
@@ -229,14 +273,19 @@ def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
             except (ValueError, LicenseStateMachineError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
 
-    @router.post("/licenses/{license_id}/rotate-key", summary="Rotation de clé JWT")
+    @router.post(
+        "/licenses/{license_id}/rotate-key",
+        summary="Rotation de clé JWT",
+    )
     async def rotate_key(
         license_id: str,
         current_user: AuthPayload = Depends(get_current_user),
     ) -> LicenseResponse:
         async with db.session() as session:
             try:
-                _, _, can_manage = await _license_permissions(session, current_user, license_id)
+                _, _, can_manage = await _license_permissions(
+                    session, current_user, license_id
+                )
                 if not can_manage:
                     raise HTTPException(status_code=403, detail="Access denied")
                 result = await _svc(session).rotate_key(license_id)
@@ -247,28 +296,35 @@ def build_router(db, cache, token_service: LicenseTokenService) -> APIRouter:
 
     # ── Admin sweep ───────────────────────────────────────────────────────────
 
-    @router.post("/admin/expire-stale", summary="Expirer les licences échues (sweep)")
+    @router.post(
+        "/admin/expire-stale",
+        summary="Expirer les licences échues (sweep)",
+    )
     async def expire_stale(
         _: AuthPayload = Depends(require_permission("admin:*")),
     ) -> dict:
-        """
-        Parcourt toutes les licences ACTIVE/TRIAL dont expires_at < now
-        et les passe à EXPIRED. À appeler via un scheduler ou manuellement.
-        """
         async with db.session() as session:
             expired = await _svc(session).expire_stale()
             await session.commit()
-        return {"expired_count": len(expired), "license_ids": expired}
+        return {
+            "expired_count": len(expired),
+            "license_ids": expired,
+        }
 
-    # ── Allowed transitions (introspection) ───────────────────────────────────
+    # ── Introspection ─────────────────────────────────────────────────────────
 
-    @router.get("/licenses/{license_id}/transitions", summary="Transitions disponibles")
+    @router.get(
+        "/licenses/{license_id}/transitions",
+        summary="Transitions disponibles",
+    )
     async def allowed_transitions(
         license_id: str,
         current_user: AuthPayload = Depends(get_current_user),
     ) -> dict:
         async with db.session() as session:
-            lic, has_access, _ = await _license_permissions(session, current_user, license_id)
+            lic, has_access, _ = await _license_permissions(
+                session, current_user, license_id
+            )
             if not has_access:
                 raise HTTPException(status_code=403, detail="Access denied")
             sm = LicenseStateMachine(lic)

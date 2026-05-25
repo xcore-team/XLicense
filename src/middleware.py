@@ -24,6 +24,7 @@ Configurer les routes non protégées via EXCLUDED_PREFIXES.
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -43,7 +44,7 @@ DEFAULT_EXCLUDED_PREFIXES: tuple[str, ...] = (
     "/app/auth/login",
     "/app/auth/register",
     "/app/auth/refresh",
-    "/app/auth/logout",  # FIX: slash ajouté (était "app/auth/logout")
+    "/app/auth/logout",
     "/app/auth/select-tenant",
     "/app/auth/oauth",
     "/app/auth/me",
@@ -95,6 +96,7 @@ class LicenseMiddleware(BaseHTTPMiddleware):
 
         try:
             results = await self._emit(self._config_event, {})
+            print(results)
             if results and isinstance(results[0], dict):
                 plugin_config = results[0]
                 self._enforce = plugin_config.get("enforce", True)
@@ -114,6 +116,7 @@ class LicenseMiddleware(BaseHTTPMiddleware):
     # ── Middleware entry point ────────────────────────────────────────────────
 
     async def dispatch(self, request: Request, call_next) -> Response:
+        # Assurer que la configuration est chargée
         if not self._config_loaded:
             await self._load_config()
 
@@ -132,6 +135,7 @@ class LicenseMiddleware(BaseHTTPMiddleware):
         license_exp = None
 
         if tenant_id and self._emit:
+            # Appel au plugin license via le bus d'événements
             results = await self._emit(self._verify_event, {"tenant_id": tenant_id})
             license_data = results[0] if results else None
 
@@ -147,6 +151,7 @@ class LicenseMiddleware(BaseHTTPMiddleware):
         request.state.license_state = license_state
         request.state.license_tenant_id = tenant_id
 
+        logger.debug("license_state: %s, is_valid: %s", license_state, is_valid)
         # Enforce check
         if self._enforce and not is_valid:
             if self._requires_protection(path):
@@ -161,6 +166,8 @@ class LicenseMiddleware(BaseHTTPMiddleware):
             response.headers["X-License-Id"] = license_id
         if license_exp:
             response.headers["X-License-Exp"] = license_exp
+
+        logger.debug(f"Response: {response.status_code} {response.headers}")
 
         return response
 
