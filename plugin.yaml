@@ -13,7 +13,7 @@ framework_version: ">=2.0.0"
 config:
   # Activation du blocage 402 si licence non active sur routes protégées
   enforce: true
-  
+
   # Routes exclues de la vérification de licence
   excluded_prefixes:
     - "/docs"
@@ -29,6 +29,7 @@ config:
     - "/app/auth/oauth"
     - "/app/auth/me"
     - "/app/auth/tenants"
+    - "/app/auth/setup"
     - "/app/auth/invites"
     - "/app/auth/password/forgot"
     - "/app/auth/password/reset"
@@ -36,6 +37,7 @@ config:
     - "/app/xlicense/plans"
     - "/app/xlicense/licenses"
     - "/app/xlicense/verify"
+    - "/app/xpay/billing/checkout"
 
   # Routes protégées (si vide, toutes les routes non exclues sont protégées)
   protected_prefixes: []
@@ -50,12 +52,17 @@ config:
 env:
   JWT_PRIVATE_KEY_PATH: ./conf/private.pem
   JWT_PUBLIC_KEY_PATH: ./conf/public.pem
-
-
+  STRIPE_PRICE_PRO: price_1TeD0SGSkawqAdX1w3KxgagE
+  STRIPE_PRICE_ENTERPRISE: price_1TeD38GSkawqAdX1orU6qH0b
+  STRIPE_PRICE_LIFETIME: price_1TeD3YGSkawqAdX12MmyhQJr
+  STRIPE_PRICE_BASIC: price_1TeCycGSkawqAdX1WNSVKLXY
 
 # ── Permissions inter-plugins ─────────────────────────────────────────────────
 permissions:
   - resource: "registry"
+    actions: ["*"]
+    effect: allow
+  - resource: "xlicense.*"
     actions: ["*"]
     effect: allow
 

@@ -4,10 +4,54 @@ from ..models.license import LicensePlan, LicenseType
 from ..repositories.license import LicensePlanRepository
 
 
-async def seed_license_plans(session: AsyncSession):
+async def _backfill_stripe_map(
+    repo: LicensePlanRepository,
+    stripe_map: dict[str, dict],
+) -> None:
+    """
+    Renseigne le mapping Stripe sur des plans déjà existants.
+
+    Ne touche qu'aux ids absents (None/"") afin de ne jamais écraser une valeur
+    posée manuellement via PATCH /plans/{id}.
+    """
+    for name, mapping in stripe_map.items():
+        plan = await repo.get_by_name(name)
+        if plan is None:
+            continue
+        price_id = (mapping or {}).get("price_id")
+        product_id = (mapping or {}).get("product_id")
+        changed = False
+        if price_id and not plan.stripe_price_id:
+            plan.stripe_price_id = price_id
+            changed = True
+        if product_id and not plan.stripe_product_id:
+            plan.stripe_product_id = product_id
+            changed = True
+        if changed:
+            await repo.save(plan)
+
+
+async def seed_license_plans(
+    session: AsyncSession,
+    stripe_map: dict[str, dict] | None = None,
+):
+    """
+    Seed des plans de licence.
+
+    stripe_map : mapping optionnel {nom_du_plan: {"price_id": ..., "product_id": ...}}
+    pour pré-remplir le lien vers le catalogue Stripe. Les ids manquants restent
+    None et peuvent être renseignés plus tard via PATCH /plans/{id}.
+    """
+    stripe_map = stripe_map or {}
+
     async with session as s:
         repo = LicensePlanRepository(session=s)
         if await repo.get_by_name("Basic Plan"):
+            # Plans déjà créés : on ne recrée rien, mais on (re)pose le mapping
+            # Stripe fourni pour combler les ids manquants (ex. ajoutés en env
+            # après le premier seed). On n'écrase jamais un id déjà renseigné.
+            await _backfill_stripe_map(repo, stripe_map)
+            await s.commit()
             return
 
         plans = [
@@ -93,5 +137,8 @@ async def seed_license_plans(session: AsyncSession):
             ),
         ]
         for plan in plans:
+            mapping = stripe_map.get(plan.name) or {}
+            plan.stripe_price_id = mapping.get("price_id")
+            plan.stripe_product_id = mapping.get("product_id")
             await repo.save(plan)
         await s.commit()

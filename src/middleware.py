@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 XLicense middleware — vérifie la licence du tenant à chaque requête.
 
@@ -23,10 +21,12 @@ Fonctionnement :
 Configurer les routes non protégées via EXCLUDED_PREFIXES.
 """
 
+from __future__ import annotations
+
 import logging
-from datetime import datetime, timezone
 from typing import Any, Callable
 
+from fastapi import HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -43,6 +43,7 @@ DEFAULT_EXCLUDED_PREFIXES: tuple[str, ...] = (
     "/xlicense/verify",
     "/app/auth/login",
     "/app/auth/register",
+    "/app/auth/setup",
     "/app/auth/refresh",
     "/app/auth/logout",
     "/app/auth/select-tenant",
@@ -74,7 +75,7 @@ class LicenseMiddleware(BaseHTTPMiddleware):
     def __init__(
         self,
         app: ASGIApp,
-        emit: Callable[[str, dict[str, Any] | None], Any] | None = None,
+        emit: Any = None,
         verify_event: str = "xlicense.verify",
         config_event: str = "xlicense.config",
     ) -> None:
@@ -89,14 +90,40 @@ class LicenseMiddleware(BaseHTTPMiddleware):
         self._excluded = DEFAULT_EXCLUDED_PREFIXES
         self._protected = None
 
+    async def _emit_event(self, name: str, data: dict[str, Any]) -> list[Any]:
+        """
+        Émet un événement et retourne la liste des résultats des handlers.
+
+        `emit` est injecté via integration.yaml. On accepte :
+          - un EventBus (type: events) → on appelle son .emit(name, data)
+          - un callable direct emit(name, data)
+        """
+        em = self._emit
+        if em is None:
+            return []
+
+        # 1. EventBus injecté (type: events) → .emit(name, data)
+        if hasattr(em, "emit"):
+            return (await em.emit(name, data)) or []
+
+        # 2. Callable direct emit(name, data)
+        if callable(em):
+            try:
+                return (await em(name, data)) or []
+            except TypeError:
+                # 3. Résolveur 0-arg (type: internal) → renvoie le service/bus
+                resolved = em()
+                if resolved is not None and hasattr(resolved, "emit"):
+                    return (await resolved.emit(name, data)) or []
+        return []
+
     async def _load_config(self) -> None:
         """Charge la configuration depuis le plugin license."""
         if self._config_loaded or not self._emit:
             return
 
         try:
-            results = await self._emit(self._config_event, {})
-            print(results)
+            results = await self._emit_event(self._config_event, {})
             if results and isinstance(results[0], dict):
                 plugin_config = results[0]
                 self._enforce = plugin_config.get("enforce", True)
@@ -112,6 +139,8 @@ class LicenseMiddleware(BaseHTTPMiddleware):
                 self._config_loaded = True
         except Exception as exc:
             logger.error("Failed to load LicenseMiddleware config: %s", exc)
+
+            logger.exception(exc)
 
     # ── Middleware entry point ────────────────────────────────────────────────
 
@@ -136,13 +165,16 @@ class LicenseMiddleware(BaseHTTPMiddleware):
 
         if tenant_id and self._emit:
             # Appel au plugin license via le bus d'événements
-            results = await self._emit(self._verify_event, {"tenant_id": tenant_id})
+            results = await self._emit_event(
+                self._verify_event, {"tenant_id": tenant_id}
+            )
             license_data = results[0] if results else None
 
             if license_data:
+                print(f"license_data: {license_data}")
                 license_state = license_data.get("state", "unknown")
                 license_id = license_data.get("id")
-                is_valid = license_state == "active"
+                is_valid = license_state == "active" or license_state == "trial"
                 license_exp = license_data.get("expires_at")
 
         # Inject into request.state for downstream use
@@ -152,9 +184,14 @@ class LicenseMiddleware(BaseHTTPMiddleware):
         request.state.license_tenant_id = tenant_id
 
         logger.debug("license_state: %s, is_valid: %s", license_state, is_valid)
-        # Enforce check
-        if self._enforce and not is_valid:
+        # Enforce check — la licence est PAR TENANT. Sans tenant résolu (onboarding,
+        # création de tenant, requêtes non scopées), il n'y a pas de licence à vérifier :
+        # on laisse passer (les routes protégées restent gardées par l'auth/tenant).
+        if tenant_id and self._enforce and not is_valid:
             if self._requires_protection(path):
+                print(
+                    f"Rejecting: tenant_id={tenant_id}, path={path}, license_state={license_state}, is_valid={is_valid}"
+                )
                 return self._reject(license_state, tenant_id)
 
         response = await call_next(request)
@@ -211,7 +248,11 @@ class LicenseMiddleware(BaseHTTPMiddleware):
                     claims = jose_jwt.get_unverified_claims(token)
                     return claims.get("tenant_id")
                 except Exception:
-                    pass
+                    print(
+                        "------------------------------------------------------------->",
+                        token,
+                    )
+                    raise HTTPException(status_code=401, detail="Invalid token")
         return None
 
     @staticmethod

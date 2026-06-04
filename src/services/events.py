@@ -7,6 +7,7 @@ LICENSE_TRANSITIONED = "xlicense.license.transitioned"
 LICENSE_RENEWED = "xlicense.license.renewed"
 LICENSE_EXPIRED = "xlicense.license.expired"
 LICENSE_KEY_ROTATED = "xlicense.license.key_rotated"
+LICENSE_PLAN_CHANGED = "xlicense.license.plan_changed"
 
 
 if TYPE_CHECKING:
@@ -84,4 +85,18 @@ class XLicenseEvents:
         await self.emit(LICENSE_KEY_ROTATED, {
             "license_id": license_id,
             "tenant_id": tenant_id,
+        })
+
+    async def license_plan_changed(
+        self,
+        license_id: str,
+        tenant_id: str,
+        plan_id: str,
+        reason: str | None = None,
+    ) -> None:
+        await self.emit(LICENSE_PLAN_CHANGED, {
+            "license_id": license_id,
+            "tenant_id": tenant_id,
+            "plan_id": plan_id,
+            "reason": reason,
         })

@@ -208,6 +208,58 @@ class LicenseService:
 
         return _to_response(lic)
 
+    async def change_plan(
+        self,
+        license_id: str,
+        plan_id: str,
+        reason: str | None = None,
+        activate: bool = True,
+    ) -> LicenseResponse:
+        """
+        Bascule une licence sur un autre plan (upgrade/downgrade).
+        Déclenché par xpayproxy après paiement / changement d'abonnement.
+        Les features/quotas dérivent du plan (join) — pas besoin de réémettre la clé.
+        Si `activate`, force l'état ACTIVE (un changement payé implique l'activation).
+        """
+        from ..repositories.license import LicensePlanRepository
+
+        lic = await self._repo.get_by_license_id(license_id)
+        if lic is None:
+            raise ValueError(f"Licence introuvable : {license_id}")
+
+        plan_repo = self._plan_repo or LicensePlanRepository(self._repo.session)
+        plan = await plan_repo.get(UUID(str(plan_id)))
+        if plan is None:
+            raise ValueError(f"Plan introuvable : {plan_id}")
+
+        lic.plan_id = plan.id
+
+        if activate:
+            sm = LicenseStateMachine(lic)
+            if sm.can_transition(LicenseState.ACTIVE):
+                sm.transition(
+                    LicenseState.ACTIVE,
+                    reason=reason or "Changement de plan (paiement)",
+                )
+
+        lic.updated_at = datetime.now(tz=timezone.utc)
+        await self._repo.session.flush()
+        await self._invalidate(lic)
+
+        logger.info(
+            "Licence [%s] changée de plan → %s (%s)", license_id, plan.name, reason
+        )
+
+        if self._events:
+            await self._events.license_plan_changed(
+                license_id=license_id,
+                tenant_id=str(lic.tenant_id),
+                plan_id=str(plan.id),
+                reason=reason,
+            )
+
+        return _to_response(lic)
+
     # ── Auto-expiry sweep ─────────────────────────────────────────────────────
 
     async def expire_stale(self) -> list[str]:

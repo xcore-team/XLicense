@@ -15,6 +15,26 @@ class LicensePlanRepository(BaseRepository[LicensePlan]):
         result = await self.session.execute(select(LicensePlan).where(LicensePlan.name == name))
         return result.scalars().first()
 
+    async def get_by_stripe(
+        self,
+        price_id: str | None = None,
+        product_id: str | None = None,
+    ) -> LicensePlan | None:
+        """Résout un plan depuis son tarif Stripe (price_id prioritaire, puis product_id)."""
+        if price_id:
+            result = await self.session.execute(
+                select(LicensePlan).where(LicensePlan.stripe_price_id == price_id)
+            )
+            plan = result.scalars().first()
+            if plan:
+                return plan
+        if product_id:
+            result = await self.session.execute(
+                select(LicensePlan).where(LicensePlan.stripe_product_id == product_id)
+            )
+            return result.scalars().first()
+        return None
+
 
 class LicenseRepository(BaseRepository[License]):
     model = License

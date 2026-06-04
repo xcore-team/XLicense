@@ -41,6 +41,40 @@ GET_TENANT_LICENSES_SCHEMA: dict = {
     "tenant_id": (str, ...),
 }
 
+RENEW_SCHEMA: dict = {
+    "license_id": (str, ...),
+    "extend_days": (int, 365),
+    "reason": (str, None),
+}
+
+CHANGE_PLAN_SCHEMA: dict = {
+    "license_id": (str, ...),
+    "plan_id": (str, ...),
+    "reason": (str, None),
+    "activate": (bool, True),
+}
+
+RESOLVE_PLAN_SCHEMA: dict = {
+    "price_id": (str, None),
+    "product_id": (str, None),
+}
+
+
+def _available_modes(plan) -> list[str]:
+    """Modes de paiement proposés par le plan, selon les ids Stripe renseignés."""
+    modes: list[str] = []
+    if plan.stripe_price_id:
+        modes.append("subscription")
+    if plan.stripe_product_id:
+        modes.append("one_time")
+    return modes
+
+
+def _billing_mode(plan) -> str:
+    """Mode par défaut (rétro-compat) : le premier mode disponible."""
+    modes = _available_modes(plan)
+    return modes[0] if modes else "unconfigured"
+
 
 class Plugin(AutoDispatchMixin, TrustedBase):
     """
@@ -55,11 +89,40 @@ class Plugin(AutoDispatchMixin, TrustedBase):
         - Routes REST : CRUD licences + plans + endpoint public /verify
     """
 
-    async def _initialize(self, db) -> None:
+    async def _initialize(self, db, stripe_map: dict | None = None) -> None:
         async with db.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-        await seed_license_plans(db.session())
+        await seed_license_plans(db.session(), stripe_map=stripe_map)
+
+    @staticmethod
+    def _stripe_map_from_env(env) -> dict:
+        """Construit le mapping plan→Stripe depuis l'environnement (ids optionnels)."""
+        def g(key: str) -> str | None:
+            val = env.get(key) if env else None
+            return val or None
+
+        # Chaque plan peut porter les deux ids : price_id (abonnement récurrent)
+        # et product_id (paiement unique). L'utilisateur choisit ensuite le mode
+        # au checkout parmi available_modes.
+        return {
+            "Basic Plan": {
+                "price_id": g("STRIPE_PRICE_BASIC"),
+                "product_id": g("STRIPE_PRODUCT_BASIC"),
+            },
+            "Pro Plan": {
+                "price_id": g("STRIPE_PRICE_PRO"),
+                "product_id": g("STRIPE_PRODUCT_PRO"),
+            },
+            "Enterprise Plan": {
+                "price_id": g("STRIPE_PRICE_ENTERPRISE"),
+                "product_id": g("STRIPE_PRODUCT_ENTERPRISE"),
+            },
+            "Lifetime Plan": {
+                "price_id": g("STRIPE_PRICE_LIFETIME"),
+                "product_id": g("STRIPE_PRODUCT_LIFETIME"),
+            },
+        }
 
     async def on_load(self) -> None:
         env = self.ctx.env
@@ -70,7 +133,7 @@ class Plugin(AutoDispatchMixin, TrustedBase):
         self._cache = cache
 
         # initialiser la base de données et les données de départ
-        await self._initialize(db)
+        await self._initialize(db, stripe_map=self._stripe_map_from_env(env))
 
         # Token service
         self._token_service = LicenseTokenService(
@@ -91,7 +154,12 @@ class Plugin(AutoDispatchMixin, TrustedBase):
         )
 
         # Sweep planifié : expire les licences échues toutes les heures
-        scheduler = self.get_service("scheduler")
+        # (scheduler optionnel — peut être désactivé dans la config)
+        scheduler = (
+            self.get_service("scheduler")
+            if self.ctx.has_service("scheduler")
+            else None
+        )
         if scheduler:
 
             @scheduler.interval(hours=1)
@@ -225,6 +293,33 @@ class Plugin(AutoDispatchMixin, TrustedBase):
         except Exception as exc:
             return error(str(exc), code="error")
 
+    @action("xlicense.renew")
+    @validate_payload(RENEW_SCHEMA, type_response="model", unset=False)
+    async def _ipc_renew(self, payload) -> dict:
+        """
+        Renouvellement d'une licence — déclenché par xpayproxy après paiement
+        (webhook invoice.paid / subscription). Étend l'échéance et réactive.
+        """
+        try:
+            async with self._db.session() as session:
+                svc = LicenseService(
+                    self._token_service,
+                    LicenseRepository(session),
+                    cache_service=self._cache,
+                    events=self._events,
+                )
+                result = await svc.renew(
+                    payload.license_id,
+                    extend_days=getattr(payload, "extend_days", 365),
+                    reason=getattr(payload, "reason", None) or "Renouvellement après paiement",
+                )
+                await session.commit()
+            return ok(license=result.model_dump())
+        except LicenseStateMachineError as exc:
+            return error(str(exc), code="invalid_transition")
+        except Exception as exc:
+            return error(str(exc), code="error")
+
     @action("xlicense.get_tenant_licenses")
     @validate_payload(GET_TENANT_LICENSES_SCHEMA, type_response="model", unset=False)
     async def _ipc_get_tenant_licenses(self, payload) -> dict:
@@ -260,10 +355,93 @@ class Plugin(AutoDispatchMixin, TrustedBase):
                         "features": p.features or {},
                         "quotas": p.quotas or {},
                         "description": p.description,
+                        "stripe_price_id": p.stripe_price_id,
+                        "stripe_product_id": p.stripe_product_id,
+                        "billing_mode": _billing_mode(p),
+                        "available_modes": _available_modes(p),
                     }
                     for p in plans
                 ]
             )
+        except Exception as exc:
+            return error(str(exc), code="error")
+
+    @action("xlicense.change_plan")
+    @validate_payload(CHANGE_PLAN_SCHEMA, type_response="model", unset=False)
+    async def _ipc_change_plan(self, payload) -> dict:
+        """Bascule une licence sur un autre plan — déclenché par xpayproxy."""
+        try:
+            async with self._db.session() as session:
+                svc = LicenseService(
+                    self._token_service,
+                    LicenseRepository(session),
+                    cache_service=self._cache,
+                    events=self._events,
+                )
+                result = await svc.change_plan(
+                    payload.license_id,
+                    payload.plan_id,
+                    reason=getattr(payload, "reason", None),
+                    activate=getattr(payload, "activate", True),
+                )
+                await session.commit()
+            return ok(license=result.model_dump())
+        except LicenseStateMachineError as exc:
+            return error(str(exc), code="invalid_transition")
+        except Exception as exc:
+            return error(str(exc), code="error")
+
+    @action("xlicense.resolve_plan")
+    @validate_payload(RESOLVE_PLAN_SCHEMA, type_response="model", unset=False)
+    async def _ipc_resolve_plan(self, payload) -> dict:
+        """Résout un plan depuis son tarif Stripe (price_id ou product_id)."""
+        try:
+            from .repositories.license import LicensePlanRepository
+
+            async with self._db.session() as session:
+                plan = await LicensePlanRepository(session).get_by_stripe(
+                    price_id=getattr(payload, "price_id", None),
+                    product_id=getattr(payload, "product_id", None),
+                )
+            if plan is None:
+                return error("Aucun plan ne correspond à ce tarif Stripe", code="not_found")
+            return ok(
+                plan_id=str(plan.id),
+                name=plan.name,
+                type=plan.type.value,
+                billing_mode=_billing_mode(plan),
+            )
+        except Exception as exc:
+            return error(str(exc), code="error")
+
+    @action("xlicense.set_plan_mapping")
+    async def _ipc_set_plan_mapping(self, payload) -> dict:
+        """Synchronise le mapping plan→Stripe depuis xpayproxy (seed au démarrage).
+
+        payload = {"mappings": [{"name": str, "price_id": str|None,
+        "product_id": str|None}, ...]}. Écrase les ids pour rester aligné sur le
+        catalogue Stripe (source de vérité). Plans introuvables ignorés.
+        """
+        try:
+            from .repositories.license import LicensePlanRepository
+
+            mappings = (payload or {}).get("mappings", []) if isinstance(payload, dict) else []
+            updated = 0
+            async with self._db.session() as session:
+                repo = LicensePlanRepository(session)
+                for m in mappings:
+                    name = m.get("name")
+                    if not name:
+                        continue
+                    plan = await repo.get_by_name(name)
+                    if plan is None:
+                        continue
+                    plan.stripe_price_id = m.get("price_id")
+                    plan.stripe_product_id = m.get("product_id")
+                    await repo.save(plan)
+                    updated += 1
+                await session.commit()
+            return ok(updated=updated)
         except Exception as exc:
             return error(str(exc), code="error")
 

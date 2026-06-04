@@ -1,12 +1,12 @@
 from typing import Awaitable, Callable
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from xcore.kernel.api import AuthPayload, get_current_user
 from xcore.sdk import require_permission
 
 from .repositories.license import LicensePlanRepository, LicenseRepository
-from .schemas import LicenseResponse, LisenseCreate
+from .schemas import LicenseResponse
 from .services.events import XLicenseEvents
 from .services.jwt import LicenseTokenService
 from .services.license import LicenseService
@@ -15,6 +15,44 @@ from .state_machine import LicenseStateMachine, LicenseStateMachineError
 
 class VerifyLicenseRequest(BaseModel):
     license_key: str
+
+
+def _plan_available_modes(plan) -> list[str]:
+    """Modes de paiement proposés par le plan, selon les ids Stripe renseignés.
+
+    Un plan peut proposer les deux : abonnement (stripe_price_id récurrent) et/ou
+    paiement unique (stripe_product_id). Le frontend laisse l'utilisateur choisir.
+    """
+    modes: list[str] = []
+    if plan.stripe_price_id:
+        modes.append("subscription")
+    if plan.stripe_product_id:
+        modes.append("one_time")
+    return modes
+
+
+def _plan_billing_mode(plan) -> str:
+    """Mode par défaut (rétro-compat) : le premier mode disponible."""
+    modes = _plan_available_modes(plan)
+    return modes[0] if modes else "unconfigured"
+
+
+def _plan_to_dict(p) -> dict:
+    return {
+        "id": str(p.id),
+        "name": p.name,
+        "type": p.type.value,
+        "price": p.price,
+        "max_users": p.max_users,
+        "max_machines": p.max_machines,
+        "features": p.features or {},
+        "quotas": p.quotas or {},
+        "description": p.description,
+        "stripe_price_id": p.stripe_price_id,
+        "stripe_product_id": p.stripe_product_id,
+        "billing_mode": _plan_billing_mode(p),
+        "available_modes": _plan_available_modes(p),
+    }
 
 
 def build_router(
@@ -44,7 +82,7 @@ def build_router(
         if caller is None:
             return False, False
         result = await caller(
-            "xauth",
+            "auth",
             "xauth.tenant_access",
             {
                 "user_id": user["sub"],
@@ -77,11 +115,43 @@ def build_router(
         return result
 
     @router.get("/me", summary="Licence du tenant courant")
-    async def my_license(request: Request) -> dict:
+    async def my_license(
+        current_user: AuthPayload = Depends(get_current_user),
+    ) -> dict:
+        # /me est exclu du middleware de licence (pour ne jamais s'auto-bloquer en
+        # 402) : on résout donc la licence ici, sans dépendre de request.state.
+        tenant_id = current_user.get("tenant_id") or current_user.get("user", {}).get(
+            "tenant_id"
+        )
+        if not tenant_id:
+            return {
+                "valid": False,
+                "state": "unknown",
+                "tenant_id": None,
+                "expires_at": None,
+            }
+
+        async with db.session() as session:
+            license_data = await _svc(session).get_active_license_for_tenant(tenant_id)
+            await session.commit()
+
+        if not license_data:
+            return {
+                "valid": False,
+                "state": "unknown",
+                "tenant_id": tenant_id,
+                "expires_at": None,
+            }
+
+        state = license_data.get("state", "unknown")
         return {
-            "valid": getattr(request.state, "license_valid", False),
-            "state": getattr(request.state, "license_state", "unknown"),
-            "tenant_id": getattr(request.state, "license_tenant_id", None),
+            "valid": state == "active",
+            "state": state,
+            "tenant_id": tenant_id,
+            "license_id": license_data.get("id"),
+            "expires_at": license_data.get("expires_at"),
+            "features": license_data.get("features", {}),
+            "quotas": license_data.get("quotas", {}),
         }
 
     # ── Plans ─────────────────────────────────────────────────────────────────
@@ -122,37 +192,46 @@ def build_router(
         async with db.session() as session:
             repo = LicensePlanRepository(session)
             plans = await repo.all()
-            return [
-                {
-                    "id": str(p.id),
-                    "name": p.name,
-                    "type": p.type.value,
-                    "max_users": p.max_users,
-                    "max_machines": p.max_machines,
-                    "features": p.features or {},
-                    "quotas": p.quotas or {},
-                }
-                for p in plans
-            ]
+            return [_plan_to_dict(p) for p in plans]
+
+    @router.patch(
+        "/plans/{plan_id}",
+        summary="Mettre à jour le mapping Stripe d'un plan (admin)",
+    )
+    async def update_plan(
+        plan_id: str,
+        body: dict,
+        _: AuthPayload = Depends(require_permission("admin:*")),
+    ) -> dict:
+        from uuid import UUID
+
+        async with db.session() as session:
+            repo = LicensePlanRepository(session)
+            plan = await repo.get(UUID(str(plan_id)))
+            if plan is None:
+                raise HTTPException(status_code=404, detail="Plan introuvable")
+            if "stripe_price_id" in body:
+                plan.stripe_price_id = body["stripe_price_id"]
+            if "stripe_product_id" in body:
+                plan.stripe_product_id = body["stripe_product_id"]
+            for field in ("price", "max_users", "max_machines", "description"):
+                if field in body:
+                    setattr(plan, field, body[field])
+            await session.commit()
+            return _plan_to_dict(plan)
 
     # ── Licences ──────────────────────────────────────────────────────────────
-
-    @router.post(
-        "/licenses",
-        response_model=LicenseResponse,
-        status_code=status.HTTP_201_CREATED,
-    )
-    async def create_license(
-        body: LisenseCreate,
-        current_user: AuthPayload = Depends(get_current_user),
-    ) -> LicenseResponse:
-        async with db.session() as session:
-            _, can_manage = await _tenant_permissions(current_user, body.tenant_id)
-            if not can_manage:
-                raise HTTPException(status_code=403, detail="Access denied")
-            result = await _svc(session).create_license(body)
-            await session.commit()
-        return result
+    #
+    # Pas de route HTTP de création / activation / renouvellement : ces opérations
+    # donnent de la valeur à une licence et ne doivent JAMAIS être déclenchables
+    # par un utilisateur (tout owner de tenant a le rôle admin → admin:*, donc
+    # un gate par permission ne suffit pas à les distinguer d'un admin plateforme).
+    #
+    # Cycle de vie d'une licence — uniquement via chemins de confiance :
+    #   • trial 30j      → handler serveur xauth.tenant.created (onboarding)
+    #   • activation     → xpayproxy webhook paiement → IPC xlicense.transition
+    #   • renouvellement → xpayproxy webhook invoice.paid → IPC xlicense.renew
+    # Ces actions IPC sont plugin-à-plugin et ne sont pas exposées en HTTP.
 
     @router.get(
         "/licenses/tenant/{tenant_id}",
@@ -186,27 +265,9 @@ def build_router(
         return result
 
     # ── State transitions ─────────────────────────────────────────────────────
-
-    @router.post("/licenses/{license_id}/activate", summary="Activer")
-    async def activate(
-        license_id: str,
-        body: dict = {},
-        current_user: AuthPayload = Depends(get_current_user),
-    ) -> LicenseResponse:
-        async with db.session() as session:
-            try:
-                _, _, can_manage = await _license_permissions(
-                    session, current_user, license_id
-                )
-                if not can_manage:
-                    raise HTTPException(status_code=403, detail="Access denied")
-                result = await _svc(session).activate(
-                    license_id, reason=body.get("reason")
-                )
-                await session.commit()
-                return result
-            except (ValueError, LicenseStateMachineError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc))
+    # `activate` (→ ACTIVE) est volontairement absent de l'API HTTP : redonner de
+    # la valeur à une licence ne peut venir que du paiement (IPC xlicense.transition).
+    # Seules les transitions « vers l'arrêt » (suspend / revoke) restent gérables.
 
     @router.post("/licenses/{license_id}/suspend", summary="Suspendre")
     async def suspend(
@@ -250,28 +311,8 @@ def build_router(
             except (ValueError, LicenseStateMachineError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
 
-    @router.post("/licenses/{license_id}/renew", summary="Renouveler")
-    async def renew(
-        license_id: str,
-        body: dict = {},
-        current_user: AuthPayload = Depends(get_current_user),
-    ) -> LicenseResponse:
-        async with db.session() as session:
-            try:
-                _, _, can_manage = await _license_permissions(
-                    session, current_user, license_id
-                )
-                if not can_manage:
-                    raise HTTPException(status_code=403, detail="Access denied")
-                result = await _svc(session).renew(
-                    license_id,
-                    extend_days=body.get("extend_days", 365),
-                    reason=body.get("reason"),
-                )
-                await session.commit()
-                return result
-            except (ValueError, LicenseStateMachineError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc))
+    # `renew` (extension d'échéance) n'est pas exposé en HTTP : un tenant ne peut
+    # se renouveler que par un paiement validé (xpayproxy → IPC xlicense.renew).
 
     @router.post(
         "/licenses/{license_id}/rotate-key",
@@ -289,6 +330,8 @@ def build_router(
                 if not can_manage:
                     raise HTTPException(status_code=403, detail="Access denied")
                 result = await _svc(session).rotate_key(license_id)
+
+                print(result.model_dump())
                 await session.commit()
                 return result
             except ValueError as exc:

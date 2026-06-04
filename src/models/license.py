@@ -45,6 +45,11 @@ class LicensePlan(Base):
     features: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     # {"max_requests_per_day": 1000, "storage_gb": 5, ...}
     quotas: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Mapping vers le catalogue Stripe — renseigné par seed (env) ou PATCH /plans/{id}.
+    # price_id  → tarif d'abonnement récurrent Stripe (Basic/Pro/Enterprise).
+    # product_id → produit du catalogue local xpay pour un achat one-time (Lifetime).
+    stripe_price_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_product_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
