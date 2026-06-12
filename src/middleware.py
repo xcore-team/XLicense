@@ -171,7 +171,6 @@ class LicenseMiddleware(BaseHTTPMiddleware):
             license_data = results[0] if results else None
 
             if license_data:
-                print(f"license_data: {license_data}")
                 license_state = license_data.get("state", "unknown")
                 license_id = license_data.get("id")
                 is_valid = license_state == "active" or license_state == "trial"
@@ -248,10 +247,6 @@ class LicenseMiddleware(BaseHTTPMiddleware):
                     claims = jose_jwt.get_unverified_claims(token)
                     return claims.get("tenant_id")
                 except Exception:
-                    print(
-                        "------------------------------------------------------------->",
-                        token,
-                    )
                     raise HTTPException(status_code=401, detail="Invalid token")
         return None
 
