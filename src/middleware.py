@@ -25,14 +25,14 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Callable
-
+from xcore.sdk import get_logger
 from fastapi import HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
-logger = logging.getLogger("xlicense.middleware")
+logger = get_logger("xlicense.middleware")
 
 # Routes par défaut (si non fournies dans le manifeste)
 DEFAULT_EXCLUDED_PREFIXES: tuple[str, ...] = (
@@ -186,12 +186,13 @@ class LicenseMiddleware(BaseHTTPMiddleware):
         # Enforce check — la licence est PAR TENANT. Sans tenant résolu (onboarding,
         # création de tenant, requêtes non scopées), il n'y a pas de licence à vérifier :
         # on laisse passer (les routes protégées restent gardées par l'auth/tenant).
-        if tenant_id and self._enforce and not is_valid:
+        if not is_valid:
+            logger.debug("reactive moi avant prod")
+            #return self._reject(license_state, tenant_id)
+        if tenant_id and self._enforce:
             if self._requires_protection(path):
-                print(
-                    f"Rejecting: tenant_id={tenant_id}, path={path}, license_state={license_state}, is_valid={is_valid}"
-                )
                 return self._reject(license_state, tenant_id)
+
 
         response = await call_next(request)
 

@@ -10,7 +10,7 @@ from xcore.sdk import (
     action,
     error,
     ok,
-    validate_payload,
+    schema,
 )
 
 from .models.license import Base, LicenseState
@@ -23,41 +23,6 @@ from .services.seed import seed_license_plans
 from .state_machine import LicenseStateMachineError
 
 logger = logging.getLogger("xlicense.plugin")
-
-
-# ── IPC payload schemas ───────────────────────────────────────────────────────
-
-VALIDATE_LICENSE_SCHEMA: dict = {
-    "license_key": (str, ...),
-}
-
-TRANSITION_SCHEMA: dict = {
-    "license_id": (str, ...),
-    "to_state": (str, ...),
-    "reason": (str, None),
-}
-
-GET_TENANT_LICENSES_SCHEMA: dict = {
-    "tenant_id": (str, ...),
-}
-
-RENEW_SCHEMA: dict = {
-    "license_id": (str, ...),
-    "extend_days": (int, 365),
-    "reason": (str, None),
-}
-
-CHANGE_PLAN_SCHEMA: dict = {
-    "license_id": (str, ...),
-    "plan_id": (str, ...),
-    "reason": (str, None),
-    "activate": (bool, True),
-}
-
-RESOLVE_PLAN_SCHEMA: dict = {
-    "price_id": (str, None),
-    "product_id": (str, None),
-}
 
 
 def _available_modes(plan) -> list[str]:
@@ -251,7 +216,7 @@ class Plugin(AutoDispatchMixin, TrustedBase):
     # ── IPC ───────────────────────────────────────────────────────────────────
 
     @action("xlicense.validate")
-    @validate_payload(VALIDATE_LICENSE_SCHEMA, type_response="model", unset=False)
+    @schema(version="1.0", input={"license_key": (str, ...)}, output={"valid": bool, "state": str, "reason": str, "license_id": str, "tenant_id": str, "expires_at": str}, type_response="model", unset=False)
     async def _ipc_validate(self, payload) -> dict:
         try:
             async with self._db.session() as session:
@@ -267,7 +232,13 @@ class Plugin(AutoDispatchMixin, TrustedBase):
             return error(str(exc), code="error")
 
     @action("xlicense.transition")
-    @validate_payload(TRANSITION_SCHEMA, type_response="model", unset=False)
+    @schema(
+        version="1.0",
+        input={"license_id": (str, ...), "to_state": (str, ...), "reason": (str, None)},
+        output={"license": dict},
+        type_response="model",
+        unset=False,
+    )
     async def _ipc_transition(self, payload) -> dict:
         try:
             to_state = LicenseState(payload.to_state)
@@ -294,7 +265,13 @@ class Plugin(AutoDispatchMixin, TrustedBase):
             return error(str(exc), code="error")
 
     @action("xlicense.renew")
-    @validate_payload(RENEW_SCHEMA, type_response="model", unset=False)
+    @schema(
+        version="1.0",
+        input={"license_id": (str, ...), "extend_days": (int, 365), "reason": (str, None)},
+        output={"license": dict},
+        type_response="model",
+        unset=False,
+    )
     async def _ipc_renew(self, payload) -> dict:
         """
         Renouvellement d'une licence — déclenché par xpayproxy après paiement
@@ -321,7 +298,7 @@ class Plugin(AutoDispatchMixin, TrustedBase):
             return error(str(exc), code="error")
 
     @action("xlicense.get_tenant_licenses")
-    @validate_payload(GET_TENANT_LICENSES_SCHEMA, type_response="model", unset=False)
+    @schema(version="1.0", input={"tenant_id": (str, ...)}, output={"licenses": list}, type_response="model", unset=False)
     async def _ipc_get_tenant_licenses(self, payload) -> dict:
         try:
             async with self._db.session() as session:
@@ -337,6 +314,7 @@ class Plugin(AutoDispatchMixin, TrustedBase):
             return error(str(exc), code="error")
 
     @action("xlicense.get_plans")
+    @schema(version="1.0", output={"plans": list})
     async def _ipc_get_plans(self, payload) -> dict:
         try:
             async with self._db.session() as session:
@@ -367,7 +345,13 @@ class Plugin(AutoDispatchMixin, TrustedBase):
             return error(str(exc), code="error")
 
     @action("xlicense.change_plan")
-    @validate_payload(CHANGE_PLAN_SCHEMA, type_response="model", unset=False)
+    @schema(
+        version="1.0",
+        input={"license_id": (str, ...), "plan_id": (str, ...), "reason": (str, None), "activate": (bool, True)},
+        output={"license": dict},
+        type_response="model",
+        unset=False,
+    )
     async def _ipc_change_plan(self, payload) -> dict:
         """Bascule une licence sur un autre plan — déclenché par xpayproxy."""
         try:
@@ -392,7 +376,13 @@ class Plugin(AutoDispatchMixin, TrustedBase):
             return error(str(exc), code="error")
 
     @action("xlicense.resolve_plan")
-    @validate_payload(RESOLVE_PLAN_SCHEMA, type_response="model", unset=False)
+    @schema(
+        version="1.0",
+        input={"price_id": (str, None), "product_id": (str, None)},
+        output={"plan_id": str, "name": str, "type": str, "billing_mode": str},
+        type_response="model",
+        unset=False,
+    )
     async def _ipc_resolve_plan(self, payload) -> dict:
         """Résout un plan depuis son tarif Stripe (price_id ou product_id)."""
         try:
@@ -415,6 +405,7 @@ class Plugin(AutoDispatchMixin, TrustedBase):
             return error(str(exc), code="error")
 
     @action("xlicense.set_plan_mapping")
+    @schema(version="1.0", input={"mappings": (list, [])}, output={"updated": int})
     async def _ipc_set_plan_mapping(self, payload) -> dict:
         """Synchronise le mapping plan→Stripe depuis xpayproxy (seed au démarrage).
 
@@ -446,6 +437,7 @@ class Plugin(AutoDispatchMixin, TrustedBase):
             return error(str(exc), code="error")
 
     @action("xlicense.expire_stale")
+    @schema(version="1.0", output={"expired_count": int, "license_ids": list})
     async def _ipc_expire_stale(self, payload) -> dict:
         try:
             async with self._db.session() as session:
