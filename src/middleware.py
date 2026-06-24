@@ -57,6 +57,7 @@ DEFAULT_EXCLUDED_PREFIXES: tuple[str, ...] = (
     "/app/xlicense/plans",
     "/app/xlicense/licenses",
     "/app/xlicense/verify",
+    "/app/xform/*"
 )
 
 
@@ -173,7 +174,7 @@ class LicenseMiddleware(BaseHTTPMiddleware):
             if license_data:
                 license_state = license_data.get("state", "unknown")
                 license_id = license_data.get("id")
-                is_valid = license_state == "active" or license_state == "trial"
+                is_valid = license_state in ("active", "trial")
                 license_exp = license_data.get("expires_at")
 
         # Inject into request.state for downstream use
@@ -186,10 +187,7 @@ class LicenseMiddleware(BaseHTTPMiddleware):
         # Enforce check — la licence est PAR TENANT. Sans tenant résolu (onboarding,
         # création de tenant, requêtes non scopées), il n'y a pas de licence à vérifier :
         # on laisse passer (les routes protégées restent gardées par l'auth/tenant).
-        if not is_valid:
-            logger.debug("reactive moi avant prod")
-            #return self._reject(license_state, tenant_id)
-        if tenant_id and self._enforce:
+        if tenant_id and self._enforce and not is_valid:
             if self._requires_protection(path):
                 return self._reject(license_state, tenant_id)
 
@@ -210,8 +208,13 @@ class LicenseMiddleware(BaseHTTPMiddleware):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _normalize_prefix(p: str) -> str:
+        """Supprime les globs de fin ('*', '/*') pour que startswith fonctionne."""
+        return p.rstrip("*").rstrip("/") if p.endswith("*") else p
+
     def _is_excluded(self, path: str) -> bool:
-        return any(path.startswith(p) for p in self._excluded)
+        return any(path.startswith(self._normalize_prefix(p)) for p in self._excluded)
 
     def _requires_protection(self, path: str) -> bool:
         if self._protected is None:

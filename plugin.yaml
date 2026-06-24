@@ -38,6 +38,7 @@ config:
     - "/app/xlicense/licenses"
     - "/app/xlicense/verify"
     - "/app/xpay/billing/checkout"
+    - "/app/xform/public/*"
 
   # Routes protégées (si vide, toutes les routes non exclues sont protégées)
   protected_prefixes: []
@@ -56,6 +57,48 @@ env:
   STRIPE_PRICE_ENTERPRISE: price_1TeD38GSkawqAdX1orU6qH0b
   STRIPE_PRICE_LIFETIME: price_1TeD3YGSkawqAdX12MmyhQJr
   STRIPE_PRICE_BASIC: price_1TeCycGSkawqAdX1WNSVKLXY
+
+# ── Événements émis ──────────────────────────────────────────────────────────
+events_emitted:
+  xlicense.license.created:
+    description: "Licence créée pour un tenant"
+    payload_schema:
+      license_id: string
+      tenant_id: string
+      plan_id: string
+      state: string
+      expires_at: string
+  xlicense.license.transitioned:
+    description: "Transition d'état d'une licence"
+    payload_schema:
+      license_id: string
+      tenant_id: string
+      from_state: string
+      to_state: string
+      reason: string
+  xlicense.license.renewed:
+    description: "Licence renouvelée après paiement"
+    payload_schema:
+      license_id: string
+      tenant_id: string
+      expires_at: string
+  xlicense.license.expired:
+    description: "Licence expirée automatiquement"
+    payload_schema:
+      license_id: string
+      tenant_id: string
+  xlicense.license.key_rotated:
+    description: "Clé de licence régénérée"
+    payload_schema:
+      license_id: string
+      tenant_id: string
+  xlicense.license.plan_changed:
+    description: "Plan de licence modifié"
+    payload_schema:
+      license_id: string
+      tenant_id: string
+      plan_id: string
+      reason: string
 
 # ── Permissions inter-plugins ─────────────────────────────────────────────────
 permissions:

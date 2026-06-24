@@ -10,6 +10,7 @@ from .schemas import LicenseResponse
 from .services.events import XLicenseEvents
 from .services.jwt import LicenseTokenService
 from .services.license import LicenseService
+from .models.license import LicenseState
 from .state_machine import LicenseStateMachine, LicenseStateMachineError
 
 
@@ -336,6 +337,31 @@ def build_router(
                 return result
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail=str(exc))
+
+    # ── Admin transition ──────────────────────────────────────────────────────
+
+    @router.post(
+        "/admin/licenses/{license_id}/transition",
+        summary="Forcer une transition d'état (admin)",
+    )
+    async def admin_transition(
+        license_id: str,
+        body: dict,
+        _: AuthPayload = Depends(require_permission("admin:*")),
+    ) -> LicenseResponse:
+        to_state = body.get("to_state")
+        reason = body.get("reason", "transition admin")
+        if not to_state:
+            raise HTTPException(status_code=422, detail="to_state requis")
+        async with db.session() as session:
+            try:
+                result = await _svc(session).transition(
+                    license_id, LicenseState(to_state), reason=reason
+                )
+                await session.commit()
+                return result
+            except (ValueError, LicenseStateMachineError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
 
     # ── Admin sweep ───────────────────────────────────────────────────────────
 
