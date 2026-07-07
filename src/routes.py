@@ -164,7 +164,7 @@ def build_router(
     )
     async def create_plan(
         body: dict,
-        _: AuthPayload = Depends(require_permission("admin:*")),
+        _: AuthPayload = Depends(require_permission("license:manage")),
     ) -> dict:
         from .models.license import LicensePlan, LicenseType
 
@@ -202,7 +202,7 @@ def build_router(
     async def update_plan(
         plan_id: str,
         body: dict,
-        _: AuthPayload = Depends(require_permission("admin:*")),
+        _: AuthPayload = Depends(require_permission("license:manage")),
     ) -> dict:
         from uuid import UUID
 
@@ -330,9 +330,14 @@ def build_router(
                 )
                 if not can_manage:
                     raise HTTPException(status_code=403, detail="Access denied")
+                lic = await _svc(session).get_by_id(license_id)
+                if lic and lic.last_validation_at:
+                    from datetime import datetime, timezone
+                    elapsed = (datetime.now(timezone.utc) - lic.last_validation_at).total_seconds()
+                    if elapsed < 86400:
+                        raise HTTPException(status_code=429, detail="Rotation déjà effectuée dans les 24h")
                 result = await _svc(session).rotate_key(license_id)
 
-                print(result.model_dump())
                 await session.commit()
                 return result
             except ValueError as exc:
@@ -347,7 +352,7 @@ def build_router(
     async def admin_transition(
         license_id: str,
         body: dict,
-        _: AuthPayload = Depends(require_permission("admin:*")),
+        _: AuthPayload = Depends(require_permission("license:manage")),
     ) -> LicenseResponse:
         to_state = body.get("to_state")
         reason = body.get("reason", "transition admin")
@@ -370,7 +375,7 @@ def build_router(
         summary="Expirer les licences échues (sweep)",
     )
     async def expire_stale(
-        _: AuthPayload = Depends(require_permission("admin:*")),
+        _: AuthPayload = Depends(require_permission("license:manage")),
     ) -> dict:
         async with db.session() as session:
             expired = await _svc(session).expire_stale()

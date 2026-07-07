@@ -120,11 +120,7 @@ class Plugin(AutoDispatchMixin, TrustedBase):
 
         # Sweep planifié : expire les licences échues toutes les heures
         # (scheduler optionnel — peut être désactivé dans la config)
-        scheduler = (
-            self.get_service("scheduler")
-            if self.ctx.has_service("scheduler")
-            else None
-        )
+        scheduler = self.get_service("scheduler")
         if scheduler:
 
             @scheduler.interval(hours=1)
@@ -297,6 +293,58 @@ class Plugin(AutoDispatchMixin, TrustedBase):
         except Exception as exc:
             return error(str(exc), code="error")
 
+    @action("xlicense.entitlements.get")
+    @schema(
+        version="1.0",
+        input={"tenant_id": (str, ...)},
+        output={
+            "tenant_id": str,
+            "valid": bool,
+            "state": str,
+            "modules": list,
+            "features": dict,
+            "quotas": dict,
+        },
+        type_response="model",
+        unset=False,
+    )
+    async def _ipc_get_entitlements(self, payload) -> dict:
+        """Entitlement effectif d'un tenant = modules/features/quotas de son plan actif.
+
+        Source de vérité de « quels modules l'organisation a le droit d'utiliser ».
+        modules == ["*"] signifie tous les modules. Un tenant sans licence active
+        renvoie valid=False et modules=[].
+        """
+        try:
+            async with self._db.session() as session:
+                svc = LicenseService(
+                    self._token_service,
+                    LicenseRepository(session),
+                    cache_service=self._cache,
+                    events=self._events,
+                )
+                data = await svc.get_active_license_for_tenant(payload.tenant_id)
+            if not data:
+                return ok(
+                    tenant_id=payload.tenant_id,
+                    valid=False,
+                    state="unknown",
+                    modules=[],
+                    features={},
+                    quotas={},
+                )
+            state = data.get("state", "unknown")
+            return ok(
+                tenant_id=payload.tenant_id,
+                valid=state in ("active", "trial"),
+                state=state,
+                modules=data.get("modules", []),
+                features=data.get("features", {}),
+                quotas=data.get("quotas", {}),
+            )
+        except Exception as exc:
+            return error(str(exc), code="error")
+
     @action("xlicense.get_tenant_licenses")
     @schema(version="1.0", input={"tenant_id": (str, ...)}, output={"licenses": list}, type_response="model", unset=False)
     async def _ipc_get_tenant_licenses(self, payload) -> dict:
@@ -332,6 +380,7 @@ class Plugin(AutoDispatchMixin, TrustedBase):
                         "max_machines": p.max_machines,
                         "features": p.features or {},
                         "quotas": p.quotas or {},
+                        "modules": p.modules or [],
                         "description": p.description,
                         "stripe_price_id": p.stripe_price_id,
                         "stripe_product_id": p.stripe_product_id,

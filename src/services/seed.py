@@ -4,6 +4,32 @@ from ..models.license import LicensePlan, LicenseType
 from ..repositories.license import LicensePlanRepository
 
 
+# Modules (segments de route) inclus par plan. ["*"] = tous les modules.
+# Les noms doivent correspondre au 1er segment de route après le plugin_prefix
+# (ex: /app/<module>/...). auth & xlicense sont toujours accessibles (exclus du gate).
+_PLAN_MODULES: dict[str, list[str]] = {
+    "Basic Plan": ["xcompany", "tasks"],
+    "Pro Plan": ["xcompany", "tasks", "xform", "xwms", "xfinance", "xaudit"],
+    "Enterprise Plan": ["*"],
+    "Lifetime Plan": ["*"],
+}
+
+
+async def _backfill_modules(repo: LicensePlanRepository) -> None:
+    """Renseigne `modules` sur des plans existants dont la liste est vide.
+
+    Idempotent : ne touche pas un plan qui a déjà des modules (personnalisation
+    via PATCH /plans/{id} préservée).
+    """
+    for name, modules in _PLAN_MODULES.items():
+        plan = await repo.get_by_name(name)
+        if plan is None:
+            continue
+        if not (plan.modules or []):
+            plan.modules = list(modules)
+            await repo.save(plan)
+
+
 async def _backfill_stripe_map(
     repo: LicensePlanRepository,
     stripe_map: dict[str, dict],
@@ -51,6 +77,7 @@ async def seed_license_plans(
             # Stripe fourni pour combler les ids manquants (ex. ajoutés en env
             # après le premier seed). On n'écrase jamais un id déjà renseigné.
             await _backfill_stripe_map(repo, stripe_map)
+            await _backfill_modules(repo)
             await s.commit()
             return
 
@@ -140,5 +167,6 @@ async def seed_license_plans(
             mapping = stripe_map.get(plan.name) or {}
             plan.stripe_price_id = mapping.get("price_id")
             plan.stripe_product_id = mapping.get("product_id")
+            plan.modules = list(_PLAN_MODULES.get(plan.name, []))
             await repo.save(plan)
         await s.commit()

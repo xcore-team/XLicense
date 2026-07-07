@@ -90,6 +90,12 @@ class LicenseMiddleware(BaseHTTPMiddleware):
         self._enforce = True
         self._excluded = DEFAULT_EXCLUDED_PREFIXES
         self._protected = None
+        # Module-gate (entitlement par plan) — OPT-IN pour ne rien casser tant que
+        # les modules des plans ne sont pas configurés. Activer via config
+        # enforce_modules: true. core_modules = toujours accessibles (auth/licence).
+        self._enforce_modules = False
+        self._core_modules: tuple[str, ...] = ("auth", "xlicense")
+        self._plugin_prefix = "/app"
 
     async def _emit_event(self, name: str, data: dict[str, Any]) -> list[Any]:
         """
@@ -136,6 +142,16 @@ class LicenseMiddleware(BaseHTTPMiddleware):
                 protected = plugin_config.get("protected_prefixes")
                 if protected:
                     self._protected = tuple(protected)
+
+                self._enforce_modules = plugin_config.get(
+                    "enforce_modules", self._enforce_modules
+                )
+                core = plugin_config.get("core_modules")
+                if core is not None:
+                    self._core_modules = tuple(core)
+                plugin_prefix = plugin_config.get("plugin_prefix")
+                if plugin_prefix:
+                    self._plugin_prefix = plugin_prefix
 
                 self._config_loaded = True
         except Exception as exc:
@@ -191,6 +207,20 @@ class LicenseMiddleware(BaseHTTPMiddleware):
             if self._requires_protection(path):
                 return self._reject(license_state, tenant_id)
 
+        # Module-gate : la licence est valide mais le module appelé est-il inclus
+        # dans le plan du tenant ? (entitlement). Opt-in via enforce_modules.
+        if (
+            tenant_id
+            and self._enforce_modules
+            and is_valid
+            and license_data is not None
+            and not self._is_excluded(path)
+        ):
+            module = self._module_for_path(path)
+            if module and not self._module_allowed(
+                module, license_data.get("modules", [])
+            ):
+                return self._reject_module(module, tenant_id)
 
         response = await call_next(request)
 
@@ -220,6 +250,46 @@ class LicenseMiddleware(BaseHTTPMiddleware):
         if self._protected is None:
             return True
         return any(path.startswith(p) for p in self._protected)
+
+    def _module_for_path(self, path: str) -> str | None:
+        """Déduit le module (plugin) ciblé = 1er segment après le plugin_prefix.
+
+        /app/xwms/stock → "xwms" ; /app/auth/me → "auth".
+        """
+        p = path
+        if self._plugin_prefix and p.startswith(self._plugin_prefix):
+            p = p[len(self._plugin_prefix):]
+        p = p.lstrip("/")
+        if not p:
+            return None
+        return p.split("/", 1)[0]
+
+    def _module_allowed(self, module: str, modules: list[str]) -> bool:
+        """Le module est-il dans l'entitlement du plan ?
+
+        core_modules (auth/licence) toujours autorisés ; ["*"] = tous.
+        """
+        if module in self._core_modules:
+            return True
+        if modules and "*" in modules:
+            return True
+        return module in (modules or [])
+
+    @staticmethod
+    def _reject_module(module: str, tenant_id: str | None) -> JSONResponse:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "module_not_in_plan",
+                "module": module,
+                "tenant_id": tenant_id,
+                "message": (
+                    f"Le module « {module} » n'est pas inclus dans le plan de ce "
+                    "tenant. Mettez à niveau votre abonnement pour y accéder."
+                ),
+            },
+            headers={"X-License-Module": module, "X-License-Module-Allowed": "false"},
+        )
 
     def _extract_tenant_id(self, request: Request) -> str | None:
         """

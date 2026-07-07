@@ -396,10 +396,27 @@ class LicenseService:
             lic.updated_at = datetime.now(tz=timezone.utc)
             await self._repo.session.flush()
 
-        # 4. Cache set
-        await self._cache_set_active(tenant_id, lic)
+        # 4. Charge le plan pour exposer modules/features/quotas (entitlement)
+        plan = None
+        try:
+            plan_repo = self._plan_repo or LicensePlanRepository(self._repo.session)
+            plan = await plan_repo.get(UUID(str(lic.plan_id)))
+        except Exception as exc:
+            logger.debug("Chargement plan (entitlement) échoué: %s", exc)
 
-        return _lic_to_dict(lic)
+        # 5. Cache set + retour (dict enrichi du plan)
+        data = _lic_to_dict(lic, plan)
+        if self._cache:
+            try:
+                await self._cache.set(
+                    _CACHE_KEY_ACTIVE.format(tenant_id=tenant_id),
+                    json.dumps(data),
+                    ttl=_CACHE_TTL,
+                )
+            except Exception as exc:
+                logger.debug("Cache set (active) error: %s", exc)
+
+        return data
 
     # ── Key rotation ──────────────────────────────────────────────────────────
 
@@ -529,6 +546,7 @@ def _lic_to_dict(lic, plan=None) -> dict:
         ),
         "features": getattr(_plan, "features", None) or {},
         "quotas": getattr(_plan, "quotas", None) or {},
+        "modules": getattr(_plan, "modules", None) or [],
     }
 
 

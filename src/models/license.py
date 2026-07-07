@@ -45,6 +45,11 @@ class LicensePlan(Base):
     features: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     # {"max_requests_per_day": 1000, "storage_gb": 5, ...}
     quotas: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Modules (plugins) inclus dans le plan = ENTITLEMENT du tenant.
+    # Liste de noms de segment de route (ex: ["xwms", "xcompany", "tasks"]).
+    # ["*"] = tous les modules. Source de vérité de « quels modules l'organisation
+    # a le droit d'utiliser » — l'org ne stocke plus cette liste.
+    modules: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     # Mapping vers le catalogue Stripe — renseigné par seed (env) ou PATCH /plans/{id}.
     # price_id  → tarif d'abonnement récurrent Stripe (Basic/Pro/Enterprise).
     # product_id → produit du catalogue local xpay pour un achat one-time (Lifetime).
