@@ -19,6 +19,17 @@ class LicenseState(str, enum.Enum):
     REVOKED = "revoked"
     TRIAL = "trial"
 
+    @property
+    def is_usable(self) -> bool:
+        """Un tenant dans cet état peut utiliser la plateforme (pas de 402).
+
+        Source de vérité unique pour « licence valide » — utilisée à la fois
+        par le middleware (gate 402) et par `LicenseService.validate()` (route
+        publique /verify), qui divergeaient auparavant (ACTIVE+TRIAL contre
+        ACTIVE seul).
+        """
+        return self in (LicenseState.ACTIVE, LicenseState.TRIAL)
+
 
 class LicenseType(str, enum.Enum):
     STARTER = "starter"
@@ -96,6 +107,9 @@ class License(Base):
         DateTime(timezone=True), nullable=True
     )
     last_validation_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_rotated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(

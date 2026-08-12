@@ -53,7 +53,9 @@ class LicenseTokenService:
                 raise JWTError("Invalid token type")
             license_id = payload["sub"]
             tenant_id = payload["tenant_id"]
-            return self.create_license_token(license_id, tenant_id, extra)
+            return self.create_license_token(
+                license_id, tenant_id, state=payload.get("state", "TRIAL"), extra=extra
+            )
         except JWTError as e:
             raise JWTError(f"Token refresh failed: {str(e)}") from e
 

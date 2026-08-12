@@ -6,7 +6,7 @@ from xcore.kernel.api import AuthPayload, get_current_user
 from xcore.sdk import require_permission
 
 from .repositories.license import LicensePlanRepository, LicenseRepository
-from .schemas import LicenseResponse
+from .schemas import LicenseResponse, PlanCreateRequest
 from .services.events import XLicenseEvents
 from .services.jwt import LicenseTokenService
 from .services.license import LicenseService
@@ -145,14 +145,27 @@ def build_router(
             }
 
         state = license_data.get("state", "unknown")
+        try:
+            # is_usable (ACTIVE ou TRIAL) — pas `state == "active"`, qui
+            # bloquait l'app pour tout tenant encore en période d'essai
+            # (même bug que le middleware avant correctif, cf. audit
+            # XLicense — même source de vérité `LicenseState.is_usable`).
+            valid = LicenseState(state).is_usable
+        except ValueError:
+            valid = False
         return {
-            "valid": state == "active",
+            "valid": valid,
             "state": state,
             "tenant_id": tenant_id,
             "license_id": license_data.get("id"),
             "expires_at": license_data.get("expires_at"),
             "features": license_data.get("features", {}),
             "quotas": license_data.get("quotas", {}),
+            "modules": license_data.get("modules", []),
+            # Détail des licences cumulées (Pro + add-on, etc.) — le champ
+            # ci-dessus reste un résumé fusionné pour la compatibilité
+            # descendante des consommateurs existants.
+            "active_licenses": license_data.get("active_licenses", []),
         }
 
     # ── Plans ─────────────────────────────────────────────────────────────────
@@ -163,17 +176,27 @@ def build_router(
         summary="Créer un plan",
     )
     async def create_plan(
-        body: dict,
+        body: PlanCreateRequest,
         _: AuthPayload = Depends(require_permission("license:manage")),
     ) -> dict:
         from .models.license import LicensePlan, LicenseType
 
         async with db.session() as session:
+            try:
+                plan_type = LicenseType(body.type)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Type de licence invalide : {body.type}")
+
             plan = LicensePlan(
-                name=body["name"],
-                type=LicenseType(body["type"]),
-                max_users=body.get("max_users", 1),
-                max_machines=body.get("max_machines", 1),
+                name=body.name,
+                type=plan_type,
+                price=body.price,
+                max_users=body.max_users,
+                max_machines=body.max_machines,
+                description=body.description,
+                features=body.features,
+                quotas=body.quotas,
+                modules=body.modules,
             )
             repo = LicensePlanRepository(session)
             saved = await repo.save(plan)
@@ -182,10 +205,12 @@ def build_router(
                 "id": str(saved.id),
                 "name": saved.name,
                 "type": saved.type.value,
+                "price": saved.price,
                 "max_users": saved.max_users,
                 "max_machines": saved.max_machines,
                 "features": saved.features or {},
                 "quotas": saved.quotas or {},
+                "modules": saved.modules or [],
             }
 
     @router.get("/plans", summary="Lister les plans")
@@ -331,9 +356,14 @@ def build_router(
                 if not can_manage:
                     raise HTTPException(status_code=403, detail="Access denied")
                 lic = await _svc(session).get_by_id(license_id)
-                if lic and lic.last_validation_at:
+                # Mesure la dernière ROTATION, pas la dernière vérification
+                # (`last_validation_at` est mis à jour par /verify, appelé en
+                # continu par des agents — le cooldown était quasiment
+                # toujours actif, sans rapport avec la fréquence réelle de
+                # rotation. Audit XLicense Constat 5).
+                if lic and lic.last_rotated_at:
                     from datetime import datetime, timezone
-                    elapsed = (datetime.now(timezone.utc) - lic.last_validation_at).total_seconds()
+                    elapsed = (datetime.now(timezone.utc) - lic.last_rotated_at).total_seconds()
                     if elapsed < 86400:
                         raise HTTPException(status_code=429, detail="Rotation déjà effectuée dans les 24h")
                 result = await _svc(session).rotate_key(license_id)

@@ -1,4 +1,4 @@
-from alembic import context
+from alembics import context
 from src.models.license import Base
 
 target_metadata = Base.metadata
