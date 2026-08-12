@@ -26,11 +26,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable
 from xcore.sdk import get_logger
-from fastapi import HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
+
+from .models.license import LicenseState
 
 logger = get_logger("xlicense.middleware")
 
@@ -190,7 +191,13 @@ class LicenseMiddleware(BaseHTTPMiddleware):
             if license_data:
                 license_state = license_data.get("state", "unknown")
                 license_id = license_data.get("id")
-                is_valid = license_state in ("active", "trial")
+                try:
+                    # Source de vérité unique (LicenseState.is_usable), partagée
+                    # avec LicenseService.validate() — auparavant divergente
+                    # (ici ACTIVE+TRIAL, là-bas ACTIVE seul).
+                    is_valid = LicenseState(license_state).is_usable
+                except ValueError:
+                    is_valid = False
                 license_exp = license_data.get("expires_at")
 
         # Inject into request.state for downstream use
@@ -293,35 +300,22 @@ class LicenseMiddleware(BaseHTTPMiddleware):
 
     def _extract_tenant_id(self, request: Request) -> str | None:
         """
-        Cherche le tenant_id dans :
-            1. request.state (si XAuthBackend a déjà décodé le token)
-            2. Header X-Tenant-Id (explicite)
-            3. JWT Authorization — decode WITHOUT vérification pour extraire tenant_id
+        Ne fait confiance qu'à `request.state.user`, posé par `XAuthBackend`
+        après vérification de la signature du token (RS256). Aucune autre
+        source n'est fiable pour une requête HTTP publique :
+          - le header `X-Tenant-Id` peut être forgé par n'importe quel
+            appelant, sans la moindre authentification ;
+          - décoder le JWT sans vérifier sa signature (`get_unverified_claims`)
+            offre exactement la même absence de garantie.
+        Les deux permettaient de se faire passer pour n'importe quel tenant et
+        de contourner le gate 402 / le gate de module (audit XLicense
+        Constat 2). Sans `request.state.user`, il n'y a pas de tenant_id fiable
+        à extraire — la requête est traitée comme non scopée (cf. dispatch()).
         """
         if hasattr(request.state, "user") and request.state.user:
             return request.state.user.get("tenant_id") or request.state.user.get(
                 "user", {}
             ).get("tenant_id")
-
-        tenant_id = request.headers.get("X-Tenant-Id")
-        if tenant_id:
-            return tenant_id
-
-        auth = (
-            request.headers.get("Authorization")
-            or request.headers.get("authorization")
-            or ""
-        )
-        if auth.startswith("Bearer "):
-            token = auth[7:].strip()
-            if token:
-                try:
-                    from jose import jwt as jose_jwt
-
-                    claims = jose_jwt.get_unverified_claims(token)
-                    return claims.get("tenant_id")
-                except Exception:
-                    raise HTTPException(status_code=401, detail="Invalid token")
         return None
 
     @staticmethod

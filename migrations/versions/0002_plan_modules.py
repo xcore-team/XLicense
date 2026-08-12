@@ -11,7 +11,7 @@ deviennent l'ENTITLEMENT du tenant. L'organisation ne stocke plus active_modules
 from typing import Sequence, Union
 
 import sqlalchemy as sa
-from alembic import op
+from alembics import op
 
 revision: str = "0002_plan_modules"
 down_revision: Union[str, Sequence[str], None] = "0001_initial"

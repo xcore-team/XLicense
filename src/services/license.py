@@ -340,7 +340,7 @@ class LicenseService:
             await self._repo.session.flush()
             await self._invalidate(lic)
 
-        is_valid = lic.state == LicenseState.ACTIVE
+        is_valid = lic.state.is_usable
 
         # Update last_validation_at
         if is_valid:
@@ -358,54 +358,129 @@ class LicenseService:
 
     async def get_active_license_for_tenant(self, tenant_id: str) -> dict | None:
         """
-        Loads the active license for a tenant, runs auto-expire, and returns a dict
-        optimized for middleware consumption.
+        Charge TOUTES les licences actuellement utilisables (ACTIVE/TRIAL)
+        d'un tenant, fusionne leurs plans (voir `_merge_entitlements`), et
+        retourne un dict optimisé pour le middleware.
+
+        Un tenant peut légitimement cumuler plusieurs licences actives à la
+        fois (ex. un abonnement Pro + un plan add-on acheté séparément) :
+        rien dans `create_license`/`change_plan` n'empêche plus d'une ligne
+        d'être ACTIVE pour le même tenant_id simultanément. Auparavant cette
+        méthode ne retenait qu'une seule "gagnante"
+        (`licenses.sort(...); lic = licenses[0]`) et jetait silencieusement
+        les modules/features/quotas de toute autre licence active — un
+        tenant avec deux plans cumulés ne recevait que l'entitlement de
+        celui trié en premier, aussi bien sur le gate de module du
+        middleware que sur la page Licence du frontend.
         """
-        # 1. Cache hit
+        # 1. Cache hit — ne court-circuite que s'il n'y avait qu'une seule
+        #    licence utilisable au moment du cache set (sinon on retombe en
+        #    base pour que la fusion reste la seule source de vérité).
         if self._cache:
             try:
                 raw = await self._cache.get(_CACHE_KEY_ACTIVE.format(tenant_id=tenant_id))
                 if raw:
                     data = json.loads(raw) if isinstance(raw, str) else raw
-                    # Reconstruct lightweight object to run auto_expire if needed
-                    lic = _dict_to_lic(data)
-                    sm = LicenseStateMachine(lic)
-                    if sm.auto_expire():
-                        # If expired in memory, we need to invalidate and fallback to DB to persist
-                        await self._invalidate(lic)
-                    else:
-                        return data
+                    if len(data.get("active_licenses", [])) <= 1:
+                        lic = _dict_to_lic(data)
+                        sm = LicenseStateMachine(lic)
+                        if sm.auto_expire():
+                            await self._invalidate(lic)
+                        else:
+                            return data
             except Exception:
                 pass
 
-        # 2. DB lookup
-        licenses = await self._repo.get_all_by(tenant_id=tenant_id)
-        if not licenses:
+        # 2. DB lookup — toutes les licences du tenant, tous états confondus.
+        all_licenses = await self._repo.get_all_by(tenant_id=tenant_id)
+        if not all_licenses:
             return None
 
-        # Sort: ACTIVE first, then most recent
-        licenses.sort(
-            key=lambda l: (l.state == LicenseState.ACTIVE, l.issued_at),
-            reverse=True
-        )
-        lic = licenses[0]
+        usable = [l for l in all_licenses if l.state.is_usable]
 
-        # 3. Auto-expire
-        sm = LicenseStateMachine(lic)
-        if sm.auto_expire():
-            lic.updated_at = datetime.now(tz=timezone.utc)
+        if not usable:
+            # Aucune licence utilisable : on retombe sur la plus récente
+            # (comportement inchangé) pour renvoyer un state exploitable par
+            # le message 402 (expired/suspended/revoked).
+            all_licenses.sort(key=lambda l: l.issued_at, reverse=True)
+            lic = all_licenses[0]
+            sm = LicenseStateMachine(lic)
+            if sm.auto_expire():
+                lic.updated_at = datetime.now(tz=timezone.utc)
+                await self._repo.session.flush()
+            data = _lic_to_dict(lic)
+            data["active_licenses"] = []
+            if self._cache:
+                try:
+                    await self._cache.set(
+                        _CACHE_KEY_ACTIVE.format(tenant_id=tenant_id),
+                        json.dumps(data),
+                        ttl=_CACHE_TTL,
+                    )
+                except Exception as exc:
+                    logger.debug("Cache set (active) error: %s", exc)
+            return data
+
+        # 3. Auto-expire chaque licence utilisable individuellement.
+        any_expired = False
+        for lic in usable:
+            sm = LicenseStateMachine(lic)
+            if sm.auto_expire():
+                lic.updated_at = datetime.now(tz=timezone.utc)
+                any_expired = True
+        if any_expired:
             await self._repo.session.flush()
+            usable = [l for l in usable if l.state.is_usable]
+            if not usable:
+                return await self.get_active_license_for_tenant(tenant_id)
 
-        # 4. Charge le plan pour exposer modules/features/quotas (entitlement)
-        plan = None
-        try:
-            plan_repo = self._plan_repo or LicensePlanRepository(self._repo.session)
-            plan = await plan_repo.get(UUID(str(lic.plan_id)))
-        except Exception as exc:
-            logger.debug("Chargement plan (entitlement) échoué: %s", exc)
+        # 4. Charge les plans (une requête par plan distinct, pas par licence)
+        #    pour fusionner modules/features/quotas.
+        plan_repo = self._plan_repo or LicensePlanRepository(self._repo.session)
+        plans_by_id: dict = {}
+        for lic in usable:
+            if lic.plan_id not in plans_by_id:
+                try:
+                    plans_by_id[lic.plan_id] = await plan_repo.get(UUID(str(lic.plan_id)))
+                except Exception as exc:
+                    logger.debug(
+                        "Chargement plan (entitlement) échoué pour licence %s: %s",
+                        lic.id, exc,
+                    )
 
-        # 5. Cache set + retour (dict enrichi du plan)
-        data = _lic_to_dict(lic, plan)
+        modules, features, quotas = _merge_entitlements(
+            [plans_by_id.get(l.plan_id) for l in usable]
+        )
+
+        # Licence "primaire" pour la rétrocompatibilité (state/id/expires_at
+        # au premier niveau du dict) — utilisée par le gate 402 et les
+        # en-têtes X-License-*, qui n'ont besoin que d'un seul état
+        # représentatif : ACTIVE avant TRIAL, puis la plus ancienne émise.
+        usable_sorted = sorted(
+            usable, key=lambda l: (l.state == LicenseState.ACTIVE, l.issued_at), reverse=True
+        )
+        primary = usable_sorted[0]
+
+        data = _lic_to_dict(primary, plans_by_id.get(primary.plan_id))
+        data["modules"] = modules
+        data["features"] = features
+        data["quotas"] = quotas
+        data["active_licenses"] = [
+            {
+                "id": str(l.id),
+                "plan_id": str(l.plan_id),
+                "plan_name": getattr(plans_by_id.get(l.plan_id), "name", None),
+                "plan_type": (
+                    plans_by_id[l.plan_id].type.value
+                    if plans_by_id.get(l.plan_id) is not None else None
+                ),
+                "state": l.state.value,
+                "expires_at": l.expires_at.isoformat() if l.expires_at else None,
+            }
+            for l in usable_sorted
+        ]
+
+        # 5. Cache set + retour
         if self._cache:
             try:
                 await self._cache.set(
@@ -443,6 +518,7 @@ class LicenseService:
         lic.license_key = new_key
         lic.license_hash = new_hash
         lic.updated_at = datetime.now(tz=timezone.utc)
+        lic.last_rotated_at = lic.updated_at
         await self._repo.session.flush()
 
         await self._invalidate(lic)
@@ -513,6 +589,45 @@ class LicenseService:
             except Exception:
                 pass
         return await self._repo.get_by_license_id(license_id)
+
+
+# ── Entitlement merge (licences cumulées) ──────────────────────────────────────
+
+def _merge_entitlements(plans: list) -> tuple[list, dict, dict]:
+    """
+    Combine les plans de plusieurs licences simultanément actives/trial pour
+    le même tenant en une seule entitlement :
+      - modules : union des modules autorisés ("*" si un seul plan l'accorde déjà)
+      - features (valeurs booléennes) : OR — un droit accordé par n'importe
+        lequel des plans cumulés reste accordé
+      - quotas (valeurs numériques) : somme — cumuler deux licences cumule
+        leurs capacités (ex. 2 × 5 Go de stockage = 10 Go)
+    Une valeur non booléenne/numérique garde la première rencontrée (pas de
+    règle de fusion évidente pour un type arbitraire).
+    """
+    modules: set[str] = set()
+    features: dict = {}
+    quotas: dict = {}
+
+    for plan in plans:
+        if plan is None:
+            continue
+        for m in (plan.modules or []):
+            modules.add(m)
+        for k, v in (plan.features or {}).items():
+            if isinstance(v, bool):
+                features[k] = features.get(k, False) or v
+            else:
+                features.setdefault(k, v)
+        for k, v in (plan.quotas or {}).items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                quotas[k] = quotas.get(k, 0) + v
+            else:
+                quotas.setdefault(k, v)
+
+    if "*" in modules:
+        modules = {"*"}
+    return sorted(modules), features, quotas
 
 
 # ── Serialization ─────────────────────────────────────────────────────────────

@@ -5,6 +5,18 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+class PlanCreateRequest(BaseModel):
+    name: str = Field(..., description="Nom unique du plan (ex: Starter, Pro)")
+    type: str = Field(..., description="Type de licence (starter, pro, enterprise, lifetime)")
+    price: float = Field(..., ge=0, description="Prix du plan")
+    max_users: int = Field(1, ge=1)
+    max_machines: int = Field(1, ge=1)
+    description: Optional[str] = None
+    features: dict = Field(default_factory=dict)
+    quotas: dict = Field(default_factory=dict)
+    modules: list[str] = Field(default_factory=list)
+
+
 class LicenseBase(BaseModel):
     tenant_id: str = Field(...,
                            description="ID du tenant associé à la licence")
