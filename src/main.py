@@ -106,8 +106,14 @@ class Plugin(AutoDispatchMixin, TrustedBase):
             public_key_path=env["JWT_PUBLIC_KEY_PATH"],
         )
 
-        # Events
-        self._events = XLicenseEvents(self.ctx.events)
+        # Events — ext.websocket optionnel (absent dans un déploiement qui ne
+        # le déclare pas, ne doit pas empêcher le chargement du plugin).
+        ws = None
+        try:
+            ws = self.get_service("ext.websocket")
+        except Exception as exc:
+            logger.warning("[xlicense] ext.websocket indisponible : %s", exc)
+        self._events = XLicenseEvents(self.ctx.events, ws=ws)
 
         # Router
         self.app = build_router(
