@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
+from sqlalchemy import select
+
 from ..models.license import License, LicenseState
 from ..repositories.license import LicensePlanRepository, LicenseRepository
 from ..schemas import LicenseResponse, LisenseCreate
@@ -268,14 +270,11 @@ class LicenseService:
         Meant to be called by a scheduler (e.g. every hour).
         Returns list of expired license IDs.
         """
-        from ..models.license import LicenseState
-
         expired_ids: list[str] = []
 
         for state in (LicenseState.ACTIVE, LicenseState.TRIAL):
             result = await self._repo.session.execute(
-                __import__("sqlalchemy", fromlist=["select"])
-                .select(License)
+                select(License)
                 .where(License.state == state)
                 .where(License.expires_at < datetime.now(tz=timezone.utc))
             )
