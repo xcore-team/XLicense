@@ -37,6 +37,10 @@ logger = get_logger("xlicense.middleware")
 
 # Routes par défaut (si non fournies dans le manifeste)
 DEFAULT_EXCLUDED_PREFIXES: tuple[str, ...] = (
+    # Le moteur de DocTypes et son Desk sont la plateforme : jamais soumis au gate (et le gate par
+    # chemin ne verrait qu'un seul module là où il y en a vingt — voir `plugin.yaml`).
+    "/app/xcore-doctype",
+    "/app/xpulse",  # le temps réel du Desk : plateforme, comme le moteur (voir plugin.yaml)
     "/docs",
     "/redoc",
     "/openapi",
@@ -58,6 +62,8 @@ DEFAULT_EXCLUDED_PREFIXES: tuple[str, ...] = (
     "/app/xlicense/plans",
     "/app/xlicense/licenses",
     "/app/xlicense/verify",
+    "/app/xlicense/modules",
+    "/app/xlicense/webhook",  # appelé par le prestataire, sans jeton : gardé par la signature
     "/app/xform/*"
 )
 

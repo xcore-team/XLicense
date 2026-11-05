@@ -12,7 +12,7 @@ Constat 5.
 from typing import Sequence, Union
 
 import sqlalchemy as sa
-from alembics import op
+from alembic import op
 
 revision: str = "0003_license_last_rotated_at"
 down_revision: Union[str, Sequence[str], None] = "0002_plan_modules"

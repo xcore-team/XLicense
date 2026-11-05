@@ -7,6 +7,11 @@ description: >
 
 execution_mode: trusted
 entry_point: src/main.py
+requires: [auth]
+# ACL IPC plugin-à-plugin (IPCAuthMiddleware, enforce_ipc=true) : seuls ces plugins
+# peuvent appeler celui-ci via call_plugin. Absent ou [] = tout refuser.
+allowed_callers:
+  - xpay
 framework_version: ">=2.0.0"
 
 # ── Configuration du plugin ───────────────────────────────────────────────────
@@ -16,6 +21,15 @@ config:
 
   # Routes exclues de la vérification de licence
   excluded_prefixes:
+    # Le moteur de DocTypes et son Desk : la PLATEFORME, jamais un module vendu à l'unité (décision
+    # du 3 nov. 2026). Le gate par chemin ne saurait de toute façon pas les distinguer : les modules
+    # métier (accounts, stock, selling…) sont des plugins, mais toutes leurs routes sont servies par
+    # le moteur sous ce seul préfixe, donc `_module_for_path` rendrait « xcore-doctype » pour chacun.
+    # Ces modules-là se gardent par les grants (`source_plugin` + `entitled_plugins` d'xauth).
+    - "/app/xcore-doctype"
+    # Le temps réel du Desk (xpulse, plateforme lui aussi) : sans cette exclusion, une organisation sans licence active recevait 402
+    # sur le flux et perdait la cloche et les documents en direct alors que le Desk reste servi (mesuré, ui/e2e/platform.e2e.mjs).
+    - "/app/xpulse"
     - "/docs"
     - "/redoc"
     - "/openapi"
@@ -37,11 +51,45 @@ config:
     - "/app/xlicense/plans"
     - "/app/xlicense/licenses"
     - "/app/xlicense/verify"
+    - "/app/xlicense/modules"
+    # Le prestataire de paiement appelle sans jeton : sans cette exclusion, un tenant impayé ne
+    # pourrait plus recevoir l'événement qui le remet en règle. La signature garde la route.
+    - "/app/xlicense/webhook"
     - "/app/xpay/billing/checkout"
     - "/app/xform/public/*"
 
   # Routes protégées (si vide, toutes les routes non exclues sont protégées)
   protected_prefixes: []
+
+  # Où le prestataire de paiement renvoie l'abonné : `<desk_url>/#/billing?module=…&session_id=…`.
+  # Construit par le serveur, jamais par le navigateur (une adresse de retour venue du client serait une
+  # redirection ouverte). Vide : le prestataire retombe sur /success et /cancel de SON domaine.
+  desk_url: ""
+
+  # Le tarif de DÉPART d'un module, appliqué à sa seule ENTRÉE au catalogue (ensuite c'est l'écran
+  # « Modules et tarifs » qui décide, et aucun redémarrage ne défait un prix posé là).
+  # `price_env` nomme la variable du bloc `env:` qui porte l'identifiant de tarif chez le prestataire :
+  # l'identifiant ne se recopie pas ici, il vit déjà à un seul endroit.
+  # Tout module non listé arrive GRATUIT — mettre en vente reste un acte explicite.
+  paid_modules:
+    sales:
+      label: Ventes
+      price: 19.99
+      currency: EUR
+      period: month
+      price_env: STRIPE_PRICE_PRO
+    stock:
+      label: Stock
+      price: 9.99
+      currency: EUR
+      period: month
+      price_env: STRIPE_PRICE_BASIC
+    crm:
+      label: Relation client
+      price: 14.99
+      currency: EUR
+      period: month
+      price_env: STRIPE_PRICE_ENTERPRISE
 
 # ── Variables d'environnement ─────────────────────────────────────────────────
 # Chargées depuis app/xauth/.env avant résolution des ${VAR}
@@ -51,6 +99,13 @@ config:
 #  env_file: .env
 
 env:
+  # Clés RS256 de licence. Chemin relatif = relatif à la RACINE de l'application (dossier de
+  # integration.yaml), pas au répertoire courant. Surcharge par variable d'environnement :
+  # XLICENSE_PRIVATE_KEY_PATH / XLICENSE_PUBLIC_KEY_PATH (chemins absolus).
+  # conf/private.pem n'est JAMAIS versionné : sans lui le plugin démarre en état DÉGRADÉ
+  # (routes de licence en 503, cause dans les journaux et /health), sans bloquer les autres plugins.
+  # Génération : openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out conf/private.pem
+  #              openssl rsa -pubout -in conf/private.pem -out conf/public.pem
   JWT_PRIVATE_KEY_PATH: ./conf/private.pem
   JWT_PUBLIC_KEY_PATH: ./conf/public.pem
   STRIPE_PRICE_PRO: price_1TeD0SGSkawqAdX1w3KxgagE

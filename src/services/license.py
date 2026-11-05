@@ -6,8 +6,6 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
-
 from ..models.license import License, LicenseState
 from ..repositories.license import LicensePlanRepository, LicenseRepository
 from ..schemas import LicenseResponse, LisenseCreate
@@ -270,11 +268,14 @@ class LicenseService:
         Meant to be called by a scheduler (e.g. every hour).
         Returns list of expired license IDs.
         """
+        from ..models.license import LicenseState
+
         expired_ids: list[str] = []
 
         for state in (LicenseState.ACTIVE, LicenseState.TRIAL):
             result = await self._repo.session.execute(
-                select(License)
+                __import__("sqlalchemy", fromlist=["select"])
+                .select(License)
                 .where(License.state == state)
                 .where(License.expires_at < datetime.now(tz=timezone.utc))
             )
@@ -408,6 +409,14 @@ class LicenseService:
                 lic.updated_at = datetime.now(tz=timezone.utc)
                 await self._repo.session.flush()
             data = _lic_to_dict(lic)
+            # L'ENTITLEMENT EST VIDE quand aucune licence n'est utilisable. `_lic_to_dict` reprend les
+            # modules du PLAN de la licence : une licence expirée annonçait donc encore `["*"]`, et tout
+            # ce qui lit cette liste sans regarder l'état — la marketplace, le gate par module, et demain
+            # l'entitlement des grants d'xauth — croyait l'organisation entièrement servie. Seul l'état
+            # reste, c'est tout ce dont le message 402 a besoin.
+            data["modules"] = []
+            data["features"] = {}
+            data["quotas"] = {}
             data["active_licenses"] = []
             if self._cache:
                 try:
@@ -450,6 +459,11 @@ class LicenseService:
         modules, features, quotas = _merge_entitlements(
             [plans_by_id.get(l.plan_id) for l in usable]
         )
+        # Les modules que l'organisation a PRIS s'ajoutent à ceux de ses plans : le plan est un
+        # préréglage commercial, l'entitlement réel est le choix de l'organisation
+        # (`license_tenant_modules`). Inutile si un plan ouvre déjà tout — c'est le cas de l'essai.
+        if "*" not in modules:
+            modules = sorted(set(modules) | set(await self._tenant_modules(tenant_id)))
 
         # Licence "primaire" pour la rétrocompatibilité (state/id/expires_at
         # au premier niveau du dict) — utilisée par le gate 402 et les
@@ -491,6 +505,22 @@ class LicenseService:
                 logger.debug("Cache set (active) error: %s", exc)
 
         return data
+
+    async def _tenant_modules(self, tenant_id: str) -> list[str]:
+        """Les modules que CETTE organisation a pris et qui comptent maintenant.
+
+        On réutilise la session du dépôt de licences : l'entitlement est lu dans la même unité de
+        travail que la licence, donc jamais d'état mi-ancien mi-nouveau. En cas de pépin (table
+        absente sur une base pas encore migrée), on retombe sur les modules des PLANS : c'est le
+        comportement d'avant, jamais une ouverture supplémentaire.
+        """
+        from ..repositories.license import LicenseTenantModuleRepository
+
+        try:
+            return await LicenseTenantModuleRepository(self._repo.session).current_codes(tenant_id)
+        except Exception as exc:  # noqa: BLE001 - lecture d'entitlement : on dégrade, on ne casse pas
+            logger.warning("entitlement par organisation illisible (%s) : plans seuls", exc)
+            return []
 
     # ── Key rotation ──────────────────────────────────────────────────────────
 
@@ -566,6 +596,19 @@ class LicenseService:
             )
         except Exception as exc:
             logger.debug("Cache set (by_id) error: %s", exc)
+
+    async def invalidate_tenant(self, tenant_id: str) -> None:
+        """Oublie l'entitlement en cache d'une organisation.
+
+        À appeler dès qu'un module est pris ou rendu : le gate du middleware lit ce cache
+        (5 min), donc sans cela un module tout juste activé resterait refusé le temps du TTL.
+        """
+        if not self._cache:
+            return
+        try:
+            await self._cache.delete(_CACHE_KEY_ACTIVE.format(tenant_id=str(tenant_id)))
+        except Exception:  # noqa: BLE001 - un cache qui ne s'efface pas ne doit pas faire échouer l'achat
+            pass
 
     async def _invalidate(self, lic) -> None:
         if not self._cache:
