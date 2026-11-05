@@ -4,8 +4,82 @@ from uuid import UUID
 from sqlalchemy.future import select
 from sqlalchemy.orm import joinedload
 
-from ..models.license import License, LicensePlan, LicenseState, LicenseType
+from ..models.license import (License, LicenseModule, LicensePlan,
+                              LicenseState, LicenseTenantModule, LicenseType)
 from .base import BaseRepository
+
+
+class LicenseModuleRepository(BaseRepository[LicenseModule]):
+    """Le catalogue des modules vendables. La clé est le `code` (nom du plugin), pas un UUID."""
+
+    model = LicenseModule
+
+    async def get_by_code(self, code: str) -> LicenseModule | None:
+        result = await self.session.execute(
+            select(LicenseModule).where(LicenseModule.code == code)
+        )
+        return result.scalars().first()
+
+    async def in_catalog(self, *, only_active: bool = True) -> list[LicenseModule]:
+        stmt = select(LicenseModule)
+        if only_active:
+            stmt = stmt.where(LicenseModule.active.is_(True))
+        result = await self.session.execute(stmt.order_by(LicenseModule.label))
+        return list(result.scalars().all())
+
+    async def free_codes(self) -> list[str]:
+        """Les modules que l'administrateur de la plateforme a mis en rayon GRATUITEMENT."""
+        result = await self.session.execute(
+            select(LicenseModule.code).where(
+                LicenseModule.active.is_(True), LicenseModule.free.is_(True)
+            )
+        )
+        return list(result.scalars().all())
+
+
+class LicenseTenantModuleRepository(BaseRepository[LicenseTenantModule]):
+    """Les modules pris par une organisation. Clé = (tenant_id, module_code)."""
+
+    model = LicenseTenantModule
+
+    async def for_tenant(self, tenant_id: str) -> list[LicenseTenantModule]:
+        result = await self.session.execute(
+            select(LicenseTenantModule)
+            .where(LicenseTenantModule.tenant_id == tenant_id)
+            .options(joinedload(LicenseTenantModule.module))
+        )
+        return list(result.unique().scalars().all())
+
+    async def get_one(self, tenant_id: str, code: str) -> LicenseTenantModule | None:
+        result = await self.session.execute(
+            select(LicenseTenantModule).where(
+                LicenseTenantModule.tenant_id == tenant_id,
+                LicenseTenantModule.module_code == code,
+            )
+        )
+        return result.scalars().first()
+
+    async def by_subscription(self, subscription_id: str) -> LicenseTenantModule | None:
+        """Retrouve le module d'après l'abonnement du prestataire.
+
+        Le filet du webhook : si l'événement n'a pas nos métadonnées, l'identifiant d'abonnement
+        qu'on a retenu à la confirmation suffit à savoir quel module d'quelle organisation est visé.
+        """
+        result = await self.session.execute(
+            select(LicenseTenantModule).where(
+                LicenseTenantModule.stripe_item_id == subscription_id
+            )
+        )
+        return result.scalars().first()
+
+    async def current_codes(self, tenant_id: str) -> list[str]:
+        """Les modules qui comptent MAINTENANT (une échéance passée ne compte plus)."""
+        now = datetime.now(tz=timezone.utc)
+        return [
+            row.module_code
+            for row in await self.for_tenant(tenant_id)
+            if row.is_current(now)
+        ]
 
 
 class LicensePlanRepository(BaseRepository[LicensePlan]):

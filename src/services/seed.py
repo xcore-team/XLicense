@@ -1,7 +1,9 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models.license import LicensePlan, LicenseType
-from ..repositories.license import LicensePlanRepository
+from ..models.license import (BillingPeriod, LicenseModule, LicensePlan,
+                              LicenseType)
+from ..repositories.license import (LicenseModuleRepository,
+                                    LicensePlanRepository)
 
 
 # Modules (segments de route) inclus par plan. ["*"] = tous les modules.
@@ -13,6 +15,84 @@ _PLAN_MODULES: dict[str, list[str]] = {
     "Enterprise Plan": ["*"],
     "Lifetime Plan": ["*"],
 }
+
+
+# Les plugins qui ne sont PAS des modules vendables : l'infrastructure du SaaS. On ne facture pas
+# l'authentification, la facturation elle-même, les notifications ni le moteur de DocTypes — ils
+# sont la plateforme. Surchargeable par `config.not_sellable` du manifeste.
+PLATFORM_PLUGINS: frozenset[str] = frozenset(
+    {"auth", "xauth", "xlicense", "xpay", "xpayproxy", "xpulse", "xcore-doctype", "system", "iam"}
+)
+
+
+async def sync_license_modules(
+    session: AsyncSession,
+    installed: list[dict],
+    *,
+    not_sellable: frozenset[str] = PLATFORM_PLUGINS,
+    pricing: dict[str, dict] | None = None,
+) -> tuple[int, int]:
+    """Aligne le catalogue sur les plugins INSTALLÉS dans cette instance (façon Odoo).
+
+    La marketplace est dans l'application : ce qu'on vend, ce sont les plugins présents dans
+    l'instance, et le registre local (`ctx.registry.all_plugins()`) en est la liste. On en reprend
+    le nom, la description et la version pour la tuile.
+
+    Deux règles, et elles comptent :
+      • un module DÉJÀ en rayon n'est jamais réécrit — le prix et le drapeau gratuit/payant sont
+        la décision de l'administrateur de la plateforme, qu'un démarrage ne doit pas défaire
+        (seule la description, purement informative, est rafraîchie) ;
+      • un nouveau module arrive GRATUIT : mettre en vente est un acte explicite, jamais un effet
+        de bord d'une installation.
+
+    Un plugin disparu n'est pas supprimé : des organisations l'ont peut-être payé, et son
+    historique de facturation doit rester lisible. Il est seulement retiré du rayon (`active`).
+    Rend (créés, retirés du rayon).
+    """
+    repo = LicenseModuleRepository(session)
+    seen: set[str] = set()
+    created = 0
+
+    for entry in installed:
+        code = (entry.get("name") or "").strip()
+        if not code or code in not_sellable:
+            continue
+        seen.add(code)
+        existing = await repo.get_by_code(code)
+        description = (entry.get("description") or "").strip()[:1024] or None
+        if existing is not None:
+            if description and existing.description != description:
+                existing.description = description  # informatif : jamais le prix
+            if not existing.active:
+                existing.active = True  # réinstallé : il revient en rayon tel qu'il était
+            continue
+        # Le tarif de départ, s'il est déclaré pour ce module. Appliqué À LA CRÉATION seulement : au prochain
+        # démarrage la règle du dessus reprend la main et le prix de l'administrateur survit.
+        wanted = (pricing or {}).get(code) or {}
+        module = LicenseModule(
+            code=code,
+            label=wanted.get("label") or code.replace("_", " ").replace("-", " ").title(),
+            description=description,
+            free=True,
+            price=0.0,
+        )
+        price_id = (wanted.get("stripe_price_id") or "").strip()
+        if price_id:
+            module.free = False
+            module.price = float(wanted.get("price") or 0)
+            module.currency = (wanted.get("currency") or "EUR")[:3].upper()
+            if wanted.get("period"):
+                module.period = BillingPeriod(str(wanted["period"]))
+            module.stripe_price_id = price_id
+        await repo.save(module)
+        created += 1
+
+    retired = 0
+    for module in await repo.in_catalog(only_active=True):
+        if module.code not in seen:
+            module.active = False
+            retired += 1
+    return created, retired
 
 
 async def _backfill_modules(repo: LicensePlanRepository) -> None:
